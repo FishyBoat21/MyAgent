@@ -1,0 +1,444 @@
+<?php
+declare(strict_types=1);
+
+require dirname(__DIR__) . '/src/Agent.php';
+require dirname(__DIR__) . '/src/SessionStore.php';
+require dirname(__DIR__) . '/src/SecurityClassifier.php';
+require dirname(__DIR__) . '/src/AskUser.php';
+
+use MyAgent\Agent;
+use MyAgent\Ansi;
+use MyAgent\AnthropicClient;
+use MyAgent\AskUser;
+use MyAgent\LocalTools;
+use MyAgent\McpClient;
+use MyAgent\SecurityClassifier;
+use MyAgent\Skills;
+use MyAgent\SessionStore;
+use MyAgent\Terminal;
+
+function check(bool $condition, string $message): void {
+    if (!$condition) { throw new RuntimeException($message); }
+}
+
+require __DIR__ . '/ui.php';
+
+$root = dirname(__DIR__);
+$skills = new Skills($root . '/tests/fixtures');
+check(str_contains($skills->summary(), 'knowledge-graph-first'), 'Project skill not discovered');
+check(str_contains($skills->read('knowledge-graph-first'), '# Knowledge-Graph-First'), 'Skill body not loaded');
+$local = new LocalTools($root, $skills);
+check(str_contains($local->call('list_files', ['path' => 'examples']), 'examples/echo-mcp.php'), 'File listing failed');
+check(str_contains($local->call('read_file', ['path' => 'config.example.json']), 'mcpServers'), 'File read failed');
+check(str_contains($local->call('run_command', ['command' => 'php -v']), 'PHP'), 'Command execution failed');
+$testFile = 'tests/.smoke-output.txt';
+check(str_contains($local->call('write_file', ['path' => $testFile, 'content' => 'written']), 'Wrote'), 'File write failed');
+check($local->call('read_file', ['path' => $testFile]) === 'written', 'File write content wrong');
+unlink($root . '/' . $testFile);
+try {
+    $local->call('read_file', ['path' => '../outside.txt']);
+    throw new RuntimeException('Path traversal allowed');
+} catch (RuntimeException $e) {
+    check($e->getMessage() !== 'Path traversal allowed', 'Path traversal allowed');
+}
+
+// --- ask_user tool -----------------------------------------------------------
+
+/** @param list<string|null> $lines */
+$scripted = static function (array $lines, ?string &$output = null): AskUser {
+    $output = '';
+    return new AskUser(
+        static function () use (&$lines): ?string {
+            return $lines === [] ? null : array_shift($lines);
+        },
+        static function (string $text) use (&$output): void {
+            $output .= $text;
+        },
+    );
+};
+
+/** @param callable(): mixed $run */
+function errorOf(callable $run): string
+{
+    try {
+        $run();
+    } catch (RuntimeException $e) {
+        return $e->getMessage();
+    }
+    throw new RuntimeException('Expected a RuntimeException');
+}
+
+$rendered = '';
+$askLocal = new LocalTools($root, $skills, 300, $scripted(['2'], $rendered));
+check($askLocal->canAskUser(), 'ask_user should be available with a reader');
+$askCatalog = [];
+foreach ($askLocal->definitions() as $definition) {
+    $askCatalog[(string) $definition['name']] = $definition;
+}
+check(isset($askCatalog['ask_user']), 'ask_user definition missing');
+$askSchema = $askCatalog['ask_user']['input_schema'] ?? [];
+check(($askSchema['properties']['options']['maxItems'] ?? 0) === 4, 'ask_user option cap missing');
+check(($askSchema['properties']['options']['minItems'] ?? 0) === 1, 'ask_user option minimum missing');
+check(($askSchema['required'] ?? []) === ['question', 'options'], 'ask_user required fields missing');
+check(
+    $askLocal->call('ask_user', ['question' => 'Pick one', 'options' => ['staging', 'production']]) === 'The user answered: production',
+    'ask_user option selection failed'
+);
+check(
+    str_contains($rendered, '1) staging')
+    && str_contains($rendered, '2) production')
+    && str_contains($rendered, '3) Other - type your own answer'),
+    'ask_user prompt rendering failed'
+);
+
+$otherLocal = new LocalTools($root, $skills, 300, $scripted(['3', 'blue']));
+check(
+    $otherLocal->call('ask_user', ['question' => 'Pick', 'options' => ['A', 'B']]) === 'The user answered: blue',
+    'ask_user Other answer failed'
+);
+$freeLocal = new LocalTools($root, $skills, 300, $scripted(['sandbox']));
+check(
+    $freeLocal->call('ask_user', ['question' => 'Pick', 'options' => ['A', 'B']]) === 'The user answered: sandbox',
+    'ask_user direct free text failed'
+);
+$retryLocal = new LocalTools($root, $skills, 300, $scripted(['0', '9', '1']));
+check(
+    $retryLocal->call('ask_user', ['question' => 'Pick', 'options' => ['staging', 'production']]) === 'The user answered: staging',
+    'ask_user retry after invalid choices failed'
+);
+$normalizeLocal = new LocalTools($root, $skills, 300, $scripted(['1']));
+check(
+    $normalizeLocal->call('ask_user', ['question' => "  Which\n environment?  ", 'options' => ["  multi\nline  \tchoice "]]) === 'The user answered: multi line choice',
+    'ask_user normalization failed'
+);
+$numericLocal = new LocalTools($root, $skills, 300, $scripted(['2']));
+check(
+    $numericLocal->call('ask_user', ['question' => 'Pick', 'options' => [1, 2]]) === 'The user answered: 2',
+    'ask_user numeric options failed'
+);
+
+check(
+    str_contains(errorOf(static fn() => (new LocalTools($root, $skills, 300, $scripted(['1'])))->call('ask_user', ['question' => '   ', 'options' => ['A']])), 'non-empty question'),
+    'ask_user accepted an empty question'
+);
+check(
+    str_contains(errorOf(static fn() => (new LocalTools($root, $skills, 300, $scripted(['1'])))->call('ask_user', ['question' => 'Pick', 'options' => []])), 'between 1 and 4'),
+    'ask_user accepted zero options'
+);
+check(
+    str_contains(errorOf(static fn() => (new LocalTools($root, $skills, 300, $scripted(['1'])))->call('ask_user', ['question' => 'Pick', 'options' => ['1', '2', '3', '4', '5']])), 'between 1 and 4'),
+    'ask_user accepted five options'
+);
+check(
+    str_contains(errorOf(static fn() => (new LocalTools($root, $skills, 300, $scripted(['1'])))->call('ask_user', ['question' => 'Pick', 'options' => ['']])), 'non-empty text'),
+    'ask_user accepted an empty option'
+);
+check(
+    str_contains(errorOf(static fn() => (new LocalTools($root, $skills, 300, $scripted(['1'])))->call('ask_user', ['question' => 'Pick', 'options' => [['nested']]])), 'non-empty text'),
+    'ask_user accepted a non-scalar option'
+);
+check(
+    str_contains(errorOf(static fn() => (new LocalTools($root, $skills, 300, $scripted(['1'])))->call('ask_user', ['question' => 'Pick', 'options' => 'A'])), 'options array'),
+    'ask_user accepted a non-array options value'
+);
+check(
+    str_contains(errorOf(static fn() => (new LocalTools($root, $skills, 300, $scripted([''])))->call('ask_user', ['question' => 'Pick', 'options' => ['A']])), 'cancelled'),
+    'ask_user did not treat an empty line as cancel'
+);
+check(
+    str_contains(errorOf(static fn() => (new LocalTools($root, $skills, 300, $scripted([])))->call('ask_user', ['question' => 'Pick', 'options' => ['A']])), 'cancelled'),
+    'ask_user did not treat EOF as cancel'
+);
+check(
+    str_contains(errorOf(static fn() => (new LocalTools($root, $skills, 300, $scripted(['0', '0', '0'])))->call('ask_user', ['question' => 'Pick', 'options' => ['A']])), 'No valid answer'),
+    'ask_user accepted three invalid selections'
+);
+
+$offline = new AskUser();
+check(!$offline->available(), 'AskUser without a reader should be unavailable');
+check(
+    str_contains(errorOf(static fn() => $offline->ask('Pick', ['A'])), 'unavailable'),
+    'AskUser unavailable message missing'
+);
+$plain = new LocalTools($root, $skills);
+check(!$plain->canAskUser(), 'ask_user should be unavailable without a reader');
+foreach ($plain->definitions() as $definition) {
+    check(($definition['name'] ?? '') !== 'ask_user', 'ask_user definition leaked without a terminal');
+}
+check(
+    str_contains(errorOf(static fn() => $plain->call('ask_user', ['question' => 'Pick', 'options' => ['A']])), 'unavailable'),
+    'Unavailable ask_user call did not error'
+);
+
+$askActor = new class('unused') extends AnthropicClient {
+    public int $calls = 0;
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+        check(str_contains($system, 'ask_user'), 'ask_user guidance missing from the system prompt');
+        $this->calls++;
+        if ($this->calls === 1) {
+            return ['content' => [['type' => 'tool_use', 'id' => 'ask-tool', 'name' => 'ask_user', 'input' => ['question' => 'Pick', 'options' => ['A', 'B']]]], 'stop_reason' => 'tool_use'];
+        }
+        check(($messages[2]['content'][0]['content'] ?? '') === 'The user answered: B', 'ask_user answer was not returned to the model');
+        return ['content' => [['type' => 'text', 'text' => 'done']], 'stop_reason' => 'end_turn'];
+    }
+};
+(new Agent($askActor, new LocalTools($root, $skills, 300, $scripted(['2'])), [], 'test', 100, 2))->run('Ask me');
+check($askActor->calls === 2, 'Agent did not continue after ask_user');
+
+$client = new McpClient('example', ['command' => PHP_BINARY, 'args' => ['examples/echo-mcp.php']], $root);
+fwrite(STDERR, "Connecting MCP test server...\n");
+$client->connect();
+fwrite(STDERR, "MCP connected.\n");
+$defs = $client->definitions();
+check(count($defs) === 1, 'MCP tool discovery failed');
+$alias = array_key_first($defs);
+check(str_contains($client->call($alias, ['text' => 'hello']), 'hello'), 'MCP tool call failed');
+$client->close();
+
+$fake = new class('unused') extends AnthropicClient {
+    public int $calls = 0;
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+        check(str_contains($system, 'knowledge-graph-first'), 'Skill catalog missing from prompt');
+        check(count($tools) >= 5, 'Local tools missing');
+        $this->calls++;
+        if ($this->calls === 1) {
+            return ['content' => [['type' => 'tool_use', 'id' => 'tool-1', 'name' => 'read_file', 'input' => ['path' => 'config.example.json']]], 'stop_reason' => 'tool_use'];
+        }
+        check(($messages[2]['content'][0]['tool_use_id'] ?? '') === 'tool-1', 'Tool result not returned to model');
+        return ['content' => [['type' => 'text', 'text' => 'done']], 'stop_reason' => 'end_turn'];
+    }
+};
+$agent = new Agent($fake, $local, [], 'test', 100, 3);
+$agent->run('Read config');
+check($fake->calls === 2, 'Agent did not continue after tool use');
+
+$sessionName = 'smoke-' . getmypid();
+$store = new SessionStore($root, $sessionName);
+$sessionFile = $root . '/.agent/sessions/' . $sessionName . '.json';
+try {
+    try {
+        new SessionStore($root, $sessionName);
+        throw new RuntimeException('Concurrent session was allowed');
+    } catch (RuntimeException $e) {
+        check($e->getMessage() !== 'Concurrent session was allowed', 'Concurrent session was allowed');
+    }
+    $first = new class('unused') extends AnthropicClient {
+        public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+            return ['content' => [['type' => 'tool_use', 'id' => 'saved-tool', 'name' => 'read_file', 'input' => ['path' => 'config.example.json']]], 'stop_reason' => 'tool_use'];
+        }
+    };
+    check((new Agent($first, $local, [], 'test', 100, 1, $store))->run('A long task') === false, 'Step limit did not report incomplete work');
+    check($store->load()['in_progress'] === true, 'Unfinished task was not checkpointed');
+    $second = new class('unused') extends AnthropicClient {
+        public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+            check(($messages[2]['content'][0]['tool_use_id'] ?? '') === 'saved-tool', 'Tool result not restored');
+            return ['content' => [['type' => 'text', 'text' => 'resumed']], 'stop_reason' => 'end_turn'];
+        }
+    };
+    (new Agent($second, $local, [], 'test', 100, 2, $store))->resume();
+    check($store->load()['in_progress'] === false, 'Completed task remains active');
+
+    $store->save(['version' => 1, 'model' => 'test', 'in_progress' => true, 'pending_results' => [], 'messages' => [
+        ['role' => 'user', 'content' => 'Write a file'],
+        ['role' => 'assistant', 'content' => [['type' => 'tool_use', 'id' => 'uncertain', 'name' => 'write_file', 'input' => ['path' => 'tests/.must-not-run.txt', 'content' => 'bad']]]],
+    ]]);
+    $recovery = new class('unused') extends AnthropicClient {
+        public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+            check(($messages[2]['content'][0]['is_error'] ?? false) === true, 'Interrupted tool was not marked uncertain');
+            return ['content' => [['type' => 'text', 'text' => 'checked']], 'stop_reason' => 'end_turn'];
+        }
+    };
+    (new Agent($recovery, $local, [], 'test', 100, 2, $store))->resume();
+    check(!is_file($root . '/tests/.must-not-run.txt'), 'Interrupted tool was executed twice');
+
+    $compacted = new class('unused') extends AnthropicClient {
+        public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+            return ['content' => [['type' => 'compaction', 'content' => 'Summary', 'signature' => 'example'], ['type' => 'text', 'text' => 'complete']], 'stop_reason' => 'end_turn'];
+        }
+    };
+    (new Agent($compacted, $local, [], 'test', 100, 2, $store))->run('Another task');
+    $saved = $store->load();
+    check(count($saved['messages']) === 1 && $saved['messages'][0]['content'][0]['type'] === 'compaction', 'Compacted history was not trimmed');
+} finally {
+    unset($store);
+    @unlink($sessionFile);
+    @unlink($root . '/.agent/sessions/' . $sessionName . '.lock');
+}
+
+// --- Security reviewer -------------------------------------------------------
+
+$catalog = [];
+foreach ($local->definitions() as $definition) {
+    $catalog[(string) $definition['name']] = $definition;
+}
+$allowJson = '{"verdict":"allow","risk":"low","category":"write","reason":"Local project file.","user_message":""}';
+$denyJson = '{"verdict":"deny","risk":"high","category":"destructive","reason":"Would delete project data.","user_message":"Blocked."}';
+$askJson = '{"verdict":"ask","risk":"high","category":"shared-state","reason":"Pushes to a shared branch.","user_message":"Confirm the push."}';
+
+// Deterministic catastrophe check: no reviewer call.
+$never = new class('unused') extends AnthropicClient {
+    public int $calls = 0;
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+        $this->calls++;
+        return ['content' => [['type' => 'text', 'text' => '{"verdict":"allow","risk":"low","category":"other","reason":"ok","user_message":""}']], 'stop_reason' => 'end_turn'];
+    }
+};
+$gate = new SecurityClassifier($never, 'reviewer', $root, ['audit_log' => '']);
+$static = $gate->review(['type' => 'tool_use', 'id' => 'static', 'name' => 'run_command', 'input' => ['command' => 'rm -rf /']], [], $catalog);
+check($static['verdict'] === 'deny' && $static['source'] === 'static', 'Catastrophic command was not blocked');
+check($never->calls === 0, 'Static check did not short-circuit the reviewer');
+$read = $gate->review(['type' => 'tool_use', 'id' => 'read', 'name' => 'read_file', 'input' => ['path' => 'README.md']], [], $catalog);
+check($read['verdict'] === 'allow' && $read['source'] === 'auto-allow', 'Read-only tool was not auto-allowed');
+check($never->calls === 0, 'Auto-allowed tool reached the reviewer');
+
+// ask_user is a side-effect-free interaction: allowed even under review_all.
+$askReviewer = new class('unused') extends AnthropicClient {
+    public int $calls = 0;
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+        $this->calls++;
+        throw new RuntimeException('ask_user must not reach the reviewer');
+    }
+};
+$askGate = new SecurityClassifier($askReviewer, 'reviewer', $root, ['audit_log' => '', 'review_all' => true]);
+$askDecision = $askGate->review(
+    ['type' => 'tool_use', 'id' => 'ask-security', 'name' => 'ask_user', 'input' => ['question' => 'Pick', 'options' => ['A']]],
+    [],
+    $catalog
+);
+check($askDecision['verdict'] === 'allow' && $askDecision['source'] === 'auto-allow', 'ask_user was not auto-allowed');
+check($askReviewer->calls === 0, 'ask_user reached the reviewer');
+
+/** @param string $json Reviewer reply text. */
+$reviewer = static fn(string $json): AnthropicClient => new class($json) extends AnthropicClient {
+    public function __construct(private string $json) {
+    }
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+        return ['content' => [['type' => 'text', 'text' => $this->json]], 'stop_reason' => 'end_turn'];
+    }
+};
+
+// Reviewer deny blocks execution and returns an error tool_result to the actor.
+$blockedFile = 'tests/.security-blocked.txt';
+$blocker = new SecurityClassifier($reviewer($denyJson), 'reviewer', $root, ['audit_log' => '']);
+$actorDenied = new class('unused') extends AnthropicClient {
+    public int $calls = 0;
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+        $this->calls++;
+        if ($this->calls === 1) {
+            return ['content' => [['type' => 'tool_use', 'id' => 'blocked-tool', 'name' => 'write_file', 'input' => ['path' => 'tests/.security-blocked.txt', 'content' => 'x']]], 'stop_reason' => 'tool_use'];
+        }
+        check(($messages[2]['content'][0]['is_error'] ?? false) === true, 'Blocked tool result was not an error');
+        check(str_contains((string) ($messages[2]['content'][0]['content'] ?? ''), 'Security reviewer blocked'), 'Block reason missing');
+        return ['content' => [['type' => 'text', 'text' => 'stopped']], 'stop_reason' => 'end_turn'];
+    }
+};
+(new Agent($actorDenied, $local, [], 'test', 100, 2, null, 24000, 2048, $blocker))->run('Write a file');
+check(!is_file($root . '/' . $blockedFile), 'Denied tool was executed');
+
+// Reviewer allow lets the call run.
+$allowedFile = 'tests/.security-allowed.txt';
+$allower = new SecurityClassifier($reviewer($allowJson), 'reviewer', $root, ['audit_log' => '']);
+$actorAllowed = new class('unused') extends AnthropicClient {
+    public int $calls = 0;
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+        $this->calls++;
+        if ($this->calls === 1) {
+            return ['content' => [['type' => 'tool_use', 'id' => 'allowed-tool', 'name' => 'write_file', 'input' => ['path' => 'tests/.security-allowed.txt', 'content' => 'ok']]], 'stop_reason' => 'tool_use'];
+        }
+        return ['content' => [['type' => 'text', 'text' => 'done']], 'stop_reason' => 'end_turn'];
+    }
+};
+(new Agent($actorAllowed, $local, [], 'test', 100, 2, null, 24000, 2048, $allower))->run('Write a file');
+check(is_file($root . '/' . $allowedFile), 'Allowed tool was not executed');
+@unlink($root . '/' . $allowedFile);
+
+// Ask: denied without an approver, allowed when the user approves.
+$askGate = new SecurityClassifier($reviewer($askJson), 'reviewer', $root, ['audit_log' => '']);
+$askCall = ['type' => 'tool_use', 'id' => 'ask', 'name' => 'run_command', 'input' => ['command' => 'git push origin main']];
+$asked = $askGate->review($askCall, [], $catalog);
+check($asked['verdict'] === 'deny' && $asked['source'] === 'ask-unavailable', 'Ask without an approver was not denied');
+$approving = new SecurityClassifier($reviewer($askJson), 'reviewer', $root, ['audit_log' => ''],
+    static fn(array $call, array $decision): bool => true);
+$approvedAsk = $approving->review($askCall, [], $catalog);
+check($approvedAsk['verdict'] === 'allow' && $approvedAsk['approved_by_user'] === true, 'Approved ask did not run');
+$declining = new SecurityClassifier($reviewer($askJson), 'reviewer', $root, ['audit_log' => ''],
+    static fn(array $call, array $decision): bool => false);
+check($declining->review($askCall, [], $catalog)['verdict'] === 'deny', 'Declined ask was not denied');
+
+// Unusable reviewer output and reviewer failures fail closed.
+$invalid = new SecurityClassifier($reviewer('I think it is fine.'), 'reviewer', $root, ['audit_log' => '']);
+$invalidDecision = $invalid->review(['type' => 'tool_use', 'id' => 'x', 'name' => 'write_file', 'input' => ['path' => 'tests/x.txt', 'content' => 'x']], [], $catalog);
+check($invalidDecision['verdict'] === 'deny' && $invalidDecision['source'] === 'invalid-output', 'Unusable verdict was not denied');
+
+$broken = new class('unused') extends AnthropicClient {
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+        throw new RuntimeException('reviewer offline');
+    }
+};
+$closed = new SecurityClassifier($broken, 'reviewer', $root, ['audit_log' => '']);
+$closedDecision = $closed->review(['type' => 'tool_use', 'id' => 'x', 'name' => 'write_file', 'input' => ['path' => 'tests/x.txt', 'content' => 'x']], [], $catalog);
+check($closedDecision['verdict'] === 'deny' && str_contains($closedDecision['reason'], 'reviewer offline'), 'Reviewer failure did not fail closed');
+$open = new SecurityClassifier($broken, 'reviewer', $root, ['audit_log' => '', 'fail_closed' => false]);
+check($open->review(['type' => 'tool_use', 'id' => 'x', 'name' => 'write_file', 'input' => ['path' => 'tests/x.txt', 'content' => 'x']], [], $catalog)['verdict'] === 'allow', 'fail_closed=false did not allow on reviewer failure');
+
+// A critical-risk "allow" is contradictory and is enforced as a deny.
+$contradiction = new SecurityClassifier(
+    $reviewer('{"verdict":"allow","risk":"critical","category":"destructive","reason":"x","user_message":""}'),
+    'reviewer', $root, ['audit_log' => '']
+);
+$contradictionDecision = $contradiction->review(['type' => 'tool_use', 'id' => 'x', 'name' => 'write_file', 'input' => ['path' => 'tests/x.txt', 'content' => 'x']], [], $catalog);
+check($contradictionDecision['verdict'] === 'deny', 'Critical-risk allow was not converted to deny');
+
+// --- Terminal UI integration -------------------------------------------------
+
+$uiOut = '';
+$uiErr = '';
+$ui = new Terminal(true, true, [
+    'color' => 'always',
+    'unicode' => 'always',
+    'width' => 72,
+    'usage' => false,
+    'spinner' => true,
+], static function (string $text) use (&$uiOut): void { $uiOut .= $text; }, static function (string $text) use (&$uiErr): void { $uiErr .= $text; });
+
+$uiActor = new class('unused') extends AnthropicClient {
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+        return [
+            'content' => [['type' => 'text', 'text' => "# Done\n\n**ok**"]],
+            'stop_reason' => 'end_turn',
+            'usage' => ['input_tokens' => 10, 'output_tokens' => 2],
+        ];
+    }
+};
+(new Agent($uiActor, $local, [], 'test', 100, 2, null, 24000, 2048, null, $ui))->run('Hi');
+check(str_contains($uiOut, 'Done') && !str_contains($uiOut, '**'), 'assistant markdown not rendered');
+check(str_contains($uiOut, "\033["), 'styled assistant output has no ANSI');
+check(str_contains($uiErr, 'Thinking'), 'spinner did not run during the styled turn');
+
+$plainOut = '';
+$plainUi = new Terminal(false, false, [
+    'color' => 'never',
+    'unicode' => 'never',
+    'markdown' => false,
+    'usage' => false,
+    'spinner' => false,
+], static function (string $text) use (&$plainOut): void { $plainOut .= $text; }, static function (string $text): void {});
+(new Agent($uiActor, $local, [], 'test', 100, 2, null, 24000, 2048, null, $plainUi))->run('Hi');
+check($plainOut === "# Done\n\n**ok**\n", 'plain assistant output changed');
+
+$toolActor = new class('unused') extends AnthropicClient {
+    public int $calls = 0;
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+        $this->calls++;
+        if ($this->calls === 1) {
+            return ['content' => [['type' => 'tool_use', 'id' => 'ui-tool', 'name' => 'read_file', 'input' => ['path' => 'missing.txt']]], 'stop_reason' => 'tool_use'];
+        }
+        return ['content' => [['type' => 'text', 'text' => 'done']], 'stop_reason' => 'end_turn'];
+    }
+};
+$uiErr = '';
+(new Agent($toolActor, $local, [], 'test', 100, 2, null, 24000, 2048, null, $ui))->run('Read a missing file');
+check(str_contains(Ansi::strip($uiErr), 'read_file'), 'tool activity missing from styled output');
+check(str_contains(Ansi::strip($uiErr), 'Not found'), 'tool error summary missing from styled output');
+
+fwrite(STDOUT, "Smoke tests passed\n");
