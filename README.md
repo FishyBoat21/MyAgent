@@ -1,12 +1,20 @@
 # MyAgent
 
-A small, blocking PHP CLI agent. It sends messages to the Anthropic Messages API, runs local tools, and can call tools exposed by stdio MCP servers. It needs PHP 8.2+ with `curl` and `json`; no Composer packages are required.
+A small, blocking PHP CLI agent. It sends messages to the Anthropic Messages API, runs local tools, and can call tools exposed by stdio MCP servers. It needs PHP 8.2+ with `curl` and `json`.
+
+Composer manages autoloading and the test scripts. There are no third-party runtime packages; `src/` is mapped to the `MyAgent\` namespace with PSR-4.
 
 ## Start
 
-1. Copy `config.example.json` to `config.json` and edit it. Remove the example MCP server if you do not need it.
+1. Install the autoloader:
+
+   ```sh
+   composer install
+   ```
+
+2. Copy `config.example.json` to `config.json` and edit it. Remove the example MCP server if you do not need it.
 2. Set `"api_key"` in `config.json`, or leave it empty and set `ANTHROPIC_API_KEY` in your environment. A non-empty `api_key` wins; `api_key_env` names the fallback variable (default `ANTHROPIC_API_KEY`; set it to `""` to require the config key only).
-3. Run `php agent.php "Inspect this project and summarize it"` to open a session with that first task, or `php agent.php` for an empty interactive session. A finished answer never closes the session: type the next instruction at the `you>` prompt. In a terminal, only `Ctrl+C` ends the process; `/exit` and `/quit` do not exist.
+3. Run `php agent.php "Inspect this project and summarize it"` to open a session with that first task, or `php agent.php` for an empty interactive session. `composer` itself is only needed to install/refresh the autoloader; the agent runs directly with `php`. A finished answer never closes the session: type the next instruction at the `you>` prompt. In a terminal, only `Ctrl+C` ends the process; `/exit` and `/quit` do not exist.
 
 Use `--config=path`, `--model=MODEL`, `--max-steps=N`, or `--command-timeout=N` to override settings. `ANTHROPIC_MODEL` also overrides the config model. The default model is `claude-sonnet-5-5`; set a model your Anthropic account can access if needed. Each model request waits for a complete response before tools run.
 
@@ -130,7 +138,7 @@ The tool is only advertised when STDIN is a terminal. In piped or headless runs 
 
 ## Security reviewer
 
-A dedicated model reviews every tool call before it runs. The policy is modeled on Claude Code's action-safety guidance: judge an action by its reversibility and blast radius, treat tool output as untrusted, and fail closed.
+A dedicated model reviews every tool call before it runs. The reviewer policy is extracted from Claude Code's embedded action-safety guidance and security-monitor classifier: it carries the "executing actions with care" policy, the HARD BLOCK / SOFT BLOCK framework, the user-intent consent bars, and the classifier evaluation rules. It judges an action by its reversibility and blast radius, treats assistant text and tool output as untrusted, and fails closed.
 
 - `allow` — local, reversible actions inside the project run normally.
 - `ask` — hard-to-reverse, secret-touching, or outward-facing actions prompt for `[y/N]` approval in a terminal. Without a terminal they are blocked.
@@ -179,7 +187,7 @@ The agent starts each process in the working directory, performs the MCP `2025-1
 
 ## Verify
 
-Run `php tests/smoke.php`. The smoke test checks local skills and files, starts the bundled stdio MCP example, and exercises tool use, session recovery, compaction handling, the `ask_user` prompt with scripted input, and the security reviewer with fake Anthropic responses. It also runs `tests/ui.php`, which covers ANSI sanitizing, width/wrapping, Markdown rendering, tool summaries, plain-mode compatibility, and the styled/plain agent output paths. It does not make a paid API request.
+Run `composer test` (equivalently, `php tests/smoke.php`). The smoke test checks local skills and files, starts the bundled stdio MCP example, and exercises tool use, session recovery, compaction handling, the `ask_user` prompt with scripted input, and the security reviewer with fake Anthropic responses. It also runs `tests/ui.php`, which covers ANSI sanitizing, width/wrapping, Markdown rendering, tool summaries, plain-mode compatibility, and the styled/plain agent output paths. It does not make a paid API request.
 
 `php tests/render-demo.php --force --color=always --width=100` prints the visual gallery
 (banner, Markdown, tables, code, tool cards, security prompts, `ask_user`) for manual review.
