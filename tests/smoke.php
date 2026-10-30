@@ -192,9 +192,12 @@ fwrite(STDERR, "Connecting MCP test server...\n");
 $client->connect();
 fwrite(STDERR, "MCP connected.\n");
 $defs = $client->definitions();
-check(count($defs) === 1, 'MCP tool discovery failed');
+check(count($defs) === 2, 'MCP tool discovery failed');
 $alias = array_key_first($defs);
 check(str_contains($client->call($alias, ['text' => 'hello']), 'hello'), 'MCP tool call failed');
+$noArg = $defs['mcp_example_ping']['input_schema'] ?? [];
+check(($noArg['type'] ?? '') === 'object', 'MCP no-arg schema lost its object type');
+check(str_contains((string) json_encode($noArg), '"properties":{}'), 'MCP no-arg schema must encode properties as a JSON object');
 $client->close();
 
 $fake = new class('unused') extends AnthropicClient {

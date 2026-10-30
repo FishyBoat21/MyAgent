@@ -13,11 +13,18 @@ while (($line = fgets(STDIN)) !== false) {
             'capabilities' => ['tools' => (object) []],
             'serverInfo' => ['name' => 'echo-example', 'version' => '1.0'],
         ],
-        'tools/list' => ['tools' => [[
-            'name' => 'echo',
-            'description' => 'Return the supplied text',
-            'inputSchema' => ['type' => 'object', 'properties' => ['text' => ['type' => 'string']], 'required' => ['text']],
-        ]]],
+        'tools/list' => ['tools' => [
+            [
+                'name' => 'echo',
+                'description' => 'Return the supplied text',
+                'inputSchema' => ['type' => 'object', 'properties' => ['text' => ['type' => 'string']], 'required' => ['text']],
+            ],
+            [
+                'name' => 'ping',
+                'description' => 'No arguments; advertises an empty properties list like many MCP servers',
+                'inputSchema' => ['type' => 'object', 'properties' => []],
+            ],
+        ]],
         'tools/call' => ['content' => [['type' => 'text', 'text' => (string) ($request['params']['arguments']['text'] ?? '')]]],
         default => null,
     };

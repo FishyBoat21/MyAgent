@@ -650,7 +650,7 @@ final class McpClient
                 $this->tools[$alias] = [
                     'name' => $alias,
                     'description' => '[MCP ' . $this->serverName . '] ' . (string) ($tool['description'] ?? ''),
-                    'input_schema' => (array) ($tool['inputSchema'] ?? ['type' => 'object', 'properties' => []]),
+                    'input_schema' => self::normalizeInputSchema($tool['inputSchema'] ?? null),
                 ];
             }
             $next = $page['result']['nextCursor'] ?? null;
@@ -658,6 +658,47 @@ final class McpClient
                 $cursor = $next;
             }
         } while ($cursor !== null);
+    }
+
+    /**
+     * Make an MCP tool schema safe to send to the Messages API.
+     *
+     * Servers commonly advertise tools without arguments as `"properties": {}`.
+     * json_decode(..., true) turns that JSON object into PHP [], and the next
+     * json_encode emits `"properties": []`, which the API rejects with
+     * `[] is not of type "object"`. Rebuild the object maps, and also repair an
+     * empty or list-shaped schema.
+     *
+     * @param mixed $schema Decoded JSON-RPC inputSchema.
+     * @return array<string, mixed>
+     */
+    private static function normalizeInputSchema(mixed $schema): array
+    {
+        if (!is_array($schema) || $schema === [] || array_is_list($schema)) {
+            return ['type' => 'object', 'properties' => new \stdClass()];
+        }
+        if (!is_string($schema['type'] ?? null) || $schema['type'] === '') {
+            $schema['type'] = 'object';
+        }
+        $schema['properties'] = self::normalizeProperties($schema['properties'] ?? []);
+        return $schema;
+    }
+
+    /**
+     * @param mixed $properties Decoded `properties` map.
+     * @return array<string, mixed>|object A PHP value the encoder writes as a JSON object.
+     */
+    private static function normalizeProperties(mixed $properties): array|object
+    {
+        if (!is_array($properties) || $properties === [] || array_is_list($properties)) {
+            return new \stdClass();
+        }
+        foreach ($properties as $name => $property) {
+            if (is_array($property) && !array_is_list($property) && array_key_exists('properties', $property)) {
+                $properties[$name]['properties'] = self::normalizeProperties($property['properties']);
+            }
+        }
+        return $properties;
     }
 
     private function alias(string $toolName): string
