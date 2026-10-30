@@ -1,0 +1,30 @@
+{
+    "name": "fishyboat21/myagent",
+    "description": "A lightweight PHP CLI coding agent with local tools, Agent Skills, stdio MCP, and an independent security reviewer.",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.2",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "MyAgent\\": "src/"
+        },
+        "classmap": [
+            "src/"
+        ]
+    },
+    "scripts": {
+        "test": "@php tests/smoke.php",
+        "test:ui": "@php tests/ui.php",
+        "demo": "@php tests/render-demo.php --force --color=always --width=100"
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

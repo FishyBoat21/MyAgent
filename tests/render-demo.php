@@ -1,12 +1,12 @@
 <?php
 declare(strict_types=1);
 
-require __DIR__ . '/../src/Ansi.php';
-require __DIR__ . '/../src/Theme.php';
-require __DIR__ . '/../src/Markdown.php';
-require __DIR__ . '/../src/Spinner.php';
-require __DIR__ . '/../src/Terminal.php';
-require __DIR__ . '/../src/AskUser.php';
+$autoload = dirname(__DIR__) . '/vendor/autoload.php';
+if (!is_file($autoload)) {
+    fwrite(STDERR, "Dependencies are not installed. Run: composer install\n");
+    exit(1);
+}
+require_once $autoload;
 
 use MyAgent\AskUser;
 use MyAgent\Terminal;
