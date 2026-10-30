@@ -60,7 +60,10 @@ final class SessionStore
             throw new RuntimeException('Could not create session checkpoint');
         }
         try {
-            $json = json_encode($state, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+            $json = json_encode(
+                $state,
+                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR
+            );
             if (file_put_contents($temp, $json, LOCK_EX) !== strlen($json) || !rename($temp, $this->path)) {
                 throw new RuntimeException('Could not save session checkpoint');
             }

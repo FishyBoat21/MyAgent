@@ -104,7 +104,7 @@ class AnthropicClient
             $body['tools'] = $tools;
         }
         $betas = [];
-        $approxChars = strlen($system) + strlen((string) json_encode($messages));
+        $approxChars = strlen($system) + strlen((string) json_encode($messages, JSON_INVALID_UTF8_SUBSTITUTE));
         if ($this->compactionThreshold > 0 && $approxChars >= $this->compactionThreshold) {
             $body['context_management'] = ['edits' => [['type' => 'compact_20260112', 'summary_max_tokens' => $this->summaryMaxTokens]]];
             $betas[] = 'compact-2026-01-12';
@@ -116,7 +116,7 @@ class AnthropicClient
         if ($betas !== []) {
             $headers[] = 'anthropic-beta: ' . implode(',', $betas);
         }
-        $payload = (string) json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $payload = $this->encodeRequestBody($body);
 
         $retryAfter = null;
         $lastError = '';
@@ -161,7 +161,10 @@ class AnthropicClient
             }
             $decoded = json_decode((string) $responseBody, true);
             if (!is_array($decoded)) {
-                throw new RuntimeException('API returned invalid JSON (HTTP ' . $status . ')');
+                $detail = trim(substr(trim((string) $responseBody), 0, 300));
+                throw new RuntimeException(
+                    'API returned invalid JSON (HTTP ' . $status . ')' . ($detail === '' ? '' : ': ' . $detail)
+                );
             }
             if ($status >= 200 && $status < 300) {
                 if (isset($decoded['error']) && is_array($decoded['error'])) {
@@ -182,6 +185,26 @@ class AnthropicClient
             }
         }
         throw new RuntimeException($lastError === '' ? 'API request failed' : $lastError . ' (after retries)');
+    }
+
+    /**
+     * Encode the request body, substituting U+FFFD for invalid UTF-8 so tool
+     * output (binary files, command bytes) cannot make the whole payload
+     * unencodable. Encoding an empty body would trigger a provider 400.
+     *
+     * @param array<string, mixed> $body
+     * @throws RuntimeException when the body still cannot be represented as JSON.
+     */
+    protected function encodeRequestBody(array $body): string
+    {
+        $payload = json_encode(
+            $body,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE
+        );
+        if ($payload === false) {
+            throw new RuntimeException('Could not encode the API request as JSON: ' . json_last_error_msg());
+        }
+        return $payload;
     }
 }
 

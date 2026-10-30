@@ -265,6 +265,37 @@ try {
     @unlink($root . '/.agent/sessions/' . $sessionName . '.lock');
 }
 
+// --- Outgoing payload encoding -----------------------------------------------
+
+$encoder = new class('unused') extends AnthropicClient {
+    /** @param array<string, mixed> $body */
+    public function encode(array $body): string {
+        return $this->encodeRequestBody($body);
+    }
+};
+$binary = "bin\xFF\xFE\x00data";
+$encodedPayload = $encoder->encode(['messages' => [['role' => 'user', 'content' => $binary]]]);
+check(trim($encodedPayload) !== '', 'Binary tool output produced an empty request body');
+check(is_array(json_decode($encodedPayload, true)), 'Binary tool output produced invalid request JSON');
+$encodingError = errorOf(static fn(): string => $encoder->encode(['value' => NAN]));
+check(
+    str_contains($encodingError, 'Could not encode the API request as JSON'),
+    'An unencodable payload was not reported as an encoding error'
+);
+
+$binarySessionName = 'smoke-binary-' . getmypid();
+$binaryStore = new SessionStore($root, $binarySessionName);
+try {
+    $binaryStore->save(['version' => 1, 'model' => 'test', 'in_progress' => false, 'pending_results' => [], 'messages' => [
+        ['role' => 'user', 'content' => $binary],
+    ]]);
+    check(is_string($binaryStore->load()['messages'][0]['content']), 'Binary session checkpoint was not readable');
+} finally {
+    unset($binaryStore);
+    @unlink($root . '/.agent/sessions/' . $binarySessionName . '.json');
+    @unlink($root . '/.agent/sessions/' . $binarySessionName . '.lock');
+}
+
 // --- Security reviewer -------------------------------------------------------
 
 $catalog = [];
