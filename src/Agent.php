@@ -573,51 +573,59 @@ final class LocalTools
         if (trim($command) === '') {
             throw new RuntimeException('Empty command');
         }
-        $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        // Capture the child's stdio through files instead of pipes. A child that
+        // waits for console input (for example `... | more`) never drains a pipe:
+        // the writer blocks, the reader blocks in fread(), and the timeout below
+        // would never get a chance to fire. Files have no such deadlock.
+        $stdoutFile = tempnam(sys_get_temp_dir(), 'myagent-cmd-out-');
+        $stderrFile = tempnam(sys_get_temp_dir(), 'myagent-cmd-err-');
+        if ($stdoutFile === false || $stderrFile === false) {
+            throw new RuntimeException('Could not create temporary files for the command output');
+        }
+        $null = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
+        $descriptors = [
+            0 => ['file', $null, 'r'],
+            1 => ['file', $stdoutFile, 'w'],
+            2 => ['file', $stderrFile, 'w'],
+        ];
         $process = proc_open($command, $descriptors, $pipes, $this->root);
         if (!is_resource($process)) {
+            @unlink($stdoutFile);
+            @unlink($stderrFile);
             throw new RuntimeException('Could not start command');
         }
-        fclose($pipes[0]);
-        stream_set_blocking($pipes[1], false);
-        stream_set_blocking($pipes[2], false);
-        // Poll both pipes to EOF: stream_select is unreliable on Windows pipes.
-        $stdout = '';
-        $stderr = '';
-        $timedOut = false;
+
         $deadline = microtime(true) + $this->commandTimeout;
-        $eofOut = $eofErr = false;
-        while (!$eofOut || !$eofErr) {
-            $chunk = (string) fread($pipes[1], 8192);
-            if ($chunk !== '') {
-                $stdout .= $chunk;
-            } elseif (($eofOut = feof($pipes[1])) && !$eofErr) {
-                // keep polling stderr
-            }
-            $chunk = (string) fread($pipes[2], 8192);
-            if ($chunk !== '') {
-                $stderr .= $chunk;
-            }
-            $eofErr = $eofErr || feof($pipes[2]);
+        $status = proc_get_status($process);
+        $timedOut = false;
+        while ($status['running']) {
             if (microtime(true) >= $deadline) {
                 $timedOut = true;
-                proc_terminate($process);
+                $this->terminateProcessTree($process, (int) ($status['pid'] ?? 0));
                 break;
             }
-            if (!$eofOut || !$eofErr) {
-                usleep(20000);
-            }
+            usleep(20000);
+            $status = proc_get_status($process);
         }
         if ($timedOut) {
-            fclose($pipes[1]);
-            fclose($pipes[2]);
-            proc_close($process);
-            throw new RuntimeException("Command timed out after {$this->commandTimeout}s\n{$this->clip($stdout)}\nSTDERR: {$this->clip($stderr)}");
+            // Give the killed tree a moment to release the output files.
+            $grace = microtime(true) + 2.0;
+            while ($status['running'] && microtime(true) < $grace) {
+                usleep(20000);
+                $status = proc_get_status($process);
+            }
         }
-        fclose($pipes[1]);
-        fclose($pipes[2]);
-        $exitCode = proc_close($process);
+        $exitCode = (int) $status['exitcode'];
+        // clip() keeps at most 20000 bytes, so there is no need to hold more.
+        $stdout = (string) @file_get_contents($stdoutFile, false, null, 0, 20001);
+        $stderr = (string) @file_get_contents($stderrFile, false, null, 0, 20001);
+        proc_close($process);
+        @unlink($stdoutFile);
+        @unlink($stderrFile);
         $output = $this->clip($stdout);
+        if ($timedOut) {
+            throw new RuntimeException("Command timed out after {$this->commandTimeout}s\n{$output}\nSTDERR: {$this->clip($stderr)}");
+        }
         if (trim($stderr) !== '') {
             $output .= ($output === '' ? '' : "\n") . 'STDERR: ' . $this->clip($stderr);
         }
@@ -625,6 +633,21 @@ final class LocalTools
             $output = '(no output)';
         }
         return $output . "\n[exit code: {$exitCode}]";
+    }
+
+    /** Kill a command and, on Windows, every process it spawned. */
+    private function terminateProcessTree($process, int $pid): void
+    {
+        if (PHP_OS_FAMILY === 'Windows' && $pid > 0 && function_exists('exec')) {
+            // proc_terminate() only kills the cmd.exe wrapper, leaving the real
+            // command (and any pager) running; /T terminates the whole tree.
+            $ignored = [];
+            exec('taskkill /F /T /PID ' . $pid . ' 2>NUL', $ignored, $code);
+            if ($code === 0) {
+                return;
+            }
+        }
+        proc_terminate($process, 9);
     }
 
     private function clip(string $text): string

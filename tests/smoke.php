@@ -34,6 +34,25 @@ $local = new LocalTools($root, $skills);
 check(str_contains($local->call('list_files', ['path' => 'examples']), 'examples/echo-mcp.php'), 'File listing failed');
 check(str_contains($local->call('read_file', ['path' => 'config.example.json']), 'mcpServers'), 'File read failed');
 check(str_contains($local->call('run_command', ['command' => 'php -v']), 'PHP'), 'Command execution failed');
+// Regression: a pager waiting for console input used to deadlock the pipe pump
+// forever, so even the command timeout could not fire.
+$started = microtime(true);
+$paged = $local->call('run_command', [
+    'command' => 'php -r "for($i=0;$i<200;$i++){echo str_repeat(\'x\',100),PHP_EOL;}" | more',
+]);
+check(str_contains($paged, 'xxx'), 'Paged command produced no output');
+check(microtime(true) - $started < 30, 'Paged command took too long');
+// Regression: the timeout must actually fire and return control.
+$short = new LocalTools($root, $skills, 1);
+$started = microtime(true);
+$timedOut = '';
+try {
+    $short->call('run_command', ['command' => 'php -r "sleep(10);"']);
+} catch (RuntimeException $e) {
+    $timedOut = $e->getMessage();
+}
+check(str_contains($timedOut, 'timed out'), 'Command timeout not enforced');
+check(microtime(true) - $started < 8, 'Command timeout took too long to fire');
 $testFile = 'tests/.smoke-output.txt';
 check(str_contains($local->call('write_file', ['path' => $testFile, 'content' => 'written']), 'Wrote'), 'File write failed');
 check($local->call('read_file', ['path' => $testFile]) === 'written', 'File write content wrong');
