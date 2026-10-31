@@ -86,6 +86,44 @@ with and always runs at the provider-default effort, regardless of the actor's
 selection. Both selections are saved in the session checkpoint and restored by
 `--continue` unless a flag overrides them.
 
+## Prompt cache and shared identity
+
+Every request carries one **shared** identity (`identity.user_id`, default `myagent`)
+as `metadata.user_id`. It is deliberately identical in every session: the provider
+partitions its prompt cache on that value, so a per-session id would start every
+session from a cold prefix. Measured against the DeepSeek Anthropic-compatible
+endpoint, a repeated 1.9k-token prefix under the same id read 1664 tokens from cache
+(88 % of the input); the same prefix under a different id missed completely.
+
+```json
+"identity": { "user_id": "myagent", "send_metadata": true, "prompt_cache_key": false },
+"cache":    { "conversation_breakpoint": true, "ttl": "5m" }
+```
+
+Precedence: `--user-id=ID` → `MYAGENT_USER_ID` → `identity.user_id` → `myagent`. Never
+make this value per session, per terminal, or per sub-agent, and do not let a proxy or
+gateway inject one. `identity.send_metadata: false` omits the field entirely (the body
+is then byte-identical to the pre-identity one).
+`identity.prompt_cache_key: true` additionally sends an OpenAI-style top-level
+`prompt_cache_key` for gateways that route on it; it is off by default because strict
+Anthropic endpoints reject unknown top-level fields.
+
+Each request sets three cache breakpoints — the system prompt, the last tool, and,
+from the second request of a session onward, the end of the conversation — so a
+growing conversation is reused instead of re-billed every turn. `cache.ttl: "1h"` asks
+for extended-TTL breakpoints (the agent sends the `extended-cache-ttl` beta header;
+providers that ignore it are unaffected). Caches are model-scoped, so the turn after a
+`/model` switch, and the first request in another project (the working directory is
+part of the system prompt), are not cache hits.
+
+`/cache` reports what the process is actually doing:
+
+```text
+  ◦ identity    myagent (shared by every session) · metadata on
+  ◦ breakpoints system · tools · last-message · ttl 1h
+  ◦ usage       7 requests · 84.2k in · 31.4k cached (25.2% hit) · 9.1k written · 12k out
+```
+
 ## Terminal UI
 
 In an interactive terminal MyAgent renders a styled session:
@@ -96,6 +134,7 @@ In an interactive terminal MyAgent renders a styled session:
 │ effort     high                                          │
 │ workspace  D:\Project\MyAgent                            │
 │ session    refactor                                      │
+│ identity    myagent                                       │
 │ security   reviewer deepseek-flash · fail-closed         │
 │ tools      5 local · 1 MCP server                        │
 ╰──────────────────────────────────────────────────────────╯

@@ -168,10 +168,12 @@ check($terminal->banner([
     'model' => 'test-model',
     'workspace' => 'D:/Project/MyAgent',
     'session' => null,
+    'identity' => 'myagent',
     'security' => 'off',
     'tools' => '5 local',
     'mcp' => '0 servers',
 ]), 'banner not shown');
+check(str_contains($err, 'myagent'), 'banner identity row missing');
 check(str_contains($err, 'MyAgent'), 'banner title missing');
 check(str_contains($err, 'test-model'), 'banner model missing');
 check(str_contains($err, "\033["), 'banner not styled');
@@ -238,6 +240,28 @@ check(str_contains(Ansi::strip($err), '348 out'), 'usage output missing');
 check(str_contains(Ansi::strip($err), 'end_turn'), 'usage stop reason missing');
 
 $err = '';
+$terminal->cacheReport([
+    'identity' => 'myagent',
+    'metadata' => true,
+    'cache_key' => false,
+    'breakpoints' => 'system · tools · last-message',
+    'ttl' => '1h',
+    'requests' => 7,
+    'input' => 84200,
+    'output' => 12000,
+    'cache_read' => 31400,
+    'cache_creation' => 9100,
+    'hit_ratio' => 31400 / (84200 + 31400 + 9100),
+]);
+// The report wraps at the terminal width, so flatten whitespace before matching.
+$cacheReport = (string) preg_replace('/\s+/', ' ', Ansi::strip($err));
+check(str_contains($cacheReport, 'myagent'), 'cache report identity missing');
+check(str_contains($cacheReport, 'shared by every session'), 'cache report lost the shared-identity note');
+check(str_contains($cacheReport, 'last-message'), 'cache report breakpoints missing');
+check(str_contains($cacheReport, '31.4k cached'), 'cache report cached tokens missing');
+check(str_contains($cacheReport, '% hit'), 'cache report hit ratio missing');
+
+$err = '';
 $spinner = $terminal->spinner('Thinking');
 check($spinner !== null, 'styled terminal returned no spinner');
 $spinner->start();
@@ -258,6 +282,19 @@ $narrow = new Terminal(true, true, [
 ], $captureOut, $captureErr);
 $narrow->warning(str_repeat('long warning ', 10));
 $narrow->usage(['input_tokens' => 12345, 'output_tokens' => 6789], 1.2, 'end_turn');
+$narrow->cacheReport([
+    'identity' => 'myagent',
+    'metadata' => true,
+    'cache_key' => false,
+    'breakpoints' => 'system · tools · last-message',
+    'ttl' => '5m',
+    'requests' => 12,
+    'input' => 184200,
+    'output' => 32000,
+    'cache_read' => 131400,
+    'cache_creation' => 1100,
+    'hit_ratio' => 131400 / (184200 + 131400 + 1100),
+]);
 $narrow->toolStart('run_command', ['command' => str_repeat('x', 100)]);
 $narrow->toolResult('read_file', ['path' => 'README.md'], str_repeat("line\n", 10), false, 0.1);
 $narrow->securityDenied([

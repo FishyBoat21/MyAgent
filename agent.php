@@ -22,7 +22,7 @@ use MyAgent\SessionStore;
 use MyAgent\Terminal;
 
 $root = getcwd();
-$options = getopt('', ['config:', 'model:', 'effort:', 'max-steps:', 'command-timeout:', 'tool-result-limit:', 'session:', 'continue', 'help', 'plain', 'no-color', 'width:', 'no-banner', 'tool-details:', 'list-models', 'refresh-models']);
+$options = getopt('', ['config:', 'model:', 'effort:', 'user-id:', 'max-steps:', 'command-timeout:', 'tool-result-limit:', 'session:', 'continue', 'help', 'plain', 'no-color', 'width:', 'no-banner', 'tool-details:', 'list-models', 'refresh-models']);
 $plain = isset($options['plain']);
 
 if (isset($options['help'])) {
@@ -33,6 +33,7 @@ if (isset($options['help'])) {
     $help->out("  --config=FILE           Config file (default: config.json next to agent.php)\n");
     $help->out("  --model=MODEL           Override the model (default: config.model)\n");
     $help->out("  --effort=LEVEL          low|medium|high|xhigh|max; omit for provider default\n");
+    $help->out("  --user-id=ID            Shared identity sent with every request (default: identity.user_id or \"myagent\")\n");
     $help->out("  --list-models           Print the provider's model catalog and exit\n");
     $help->out("  --refresh-models        Bypass the cached catalog with --list-models\n");
     $help->out("  --max-steps=N           Model calls per run (default: 100)\n");
@@ -49,6 +50,7 @@ if (isset($options['help'])) {
     $help->out("\nInteractive commands:\n");
     $help->out("  /model [id|number]      Show or switch the model\n");
     $help->out("  /effort [level]         Show or switch the reasoning effort\n");
+    $help->out("  /cache                  Show identity, cache breakpoints and hit rate\n");
     $help->out("  /continue               Give unfinished work another step budget\n");
     $help->out("  /help                   Show this command list\n");
     $help->out("  Ctrl+C                  Exit the session\n");
@@ -118,6 +120,32 @@ try {
         || str_contains($apiKeyPrefix, "\r") || str_contains($apiKeyPrefix, "\n")
         || str_contains($apiVersion, "\r") || str_contains($apiVersion, "\n")) {
         throw new RuntimeException('Invalid API URL or header configuration');
+    }
+    // Shared identity: ONE value for every session. The provider partitions its
+    // prompt cache on it (measured: a different id misses entirely), so it must
+    // never be derived from a pid, a session name, or the clock.
+    $identityConfig = $config['identity'] ?? [];
+    if (!is_array($identityConfig)) {
+        throw new RuntimeException('identity must be an object');
+    }
+    $sendMetadata = (bool) ($identityConfig['send_metadata'] ?? true);
+    $sendCacheKey = (bool) ($identityConfig['prompt_cache_key'] ?? false);
+    $rawUserId = isset($options['user-id'])
+        ? (string) $options['user-id']
+        : (string) (getenv('MYAGENT_USER_ID') ?: ($identityConfig['user_id'] ?? 'myagent'));
+    $userId = trim($rawUserId);
+    if ($userId === '') {
+        $userId = 'myagent';
+    }
+    AnthropicClient::assertValidUserId($userId);
+    $cacheConfig = $config['cache'] ?? [];
+    if (!is_array($cacheConfig)) {
+        throw new RuntimeException('cache must be an object');
+    }
+    $conversationBreakpoint = (bool) ($cacheConfig['conversation_breakpoint'] ?? true);
+    $cacheTtl = strtolower(trim((string) ($cacheConfig['ttl'] ?? '5m')));
+    if (!in_array($cacheTtl, AnthropicClient::CACHE_TTLS, true)) {
+        throw new RuntimeException('cache.ttl must be "5m" or "1h"');
     }
     // Provider catalog: an explicit models_url always wins. Otherwise a small
     // known-provider map covers the two endpoints this agent targets; unknown
@@ -302,6 +330,13 @@ try {
 
     $api = new AnthropicClient((string) $apiKey, $apiUrl, $apiKeyHeader, $apiKeyPrefix, $apiVersion);
     $api->setEffort($effort);
+    // One client, set once: the actor AND the security reviewer inherit the same
+    // identity, so both land in the same prompt-cache partition.
+    if ($sendMetadata) {
+        $api->setUserId($userId);
+    }
+    $api->setSendCacheKey($sendCacheKey);
+    $api->setCacheOptions($conversationBreakpoint, $cacheTtl);
     $securityOptions = $config['security'] ?? [];
     if (!is_array($securityOptions)) {
         throw new RuntimeException('security must be an object');
@@ -336,6 +371,7 @@ try {
         'session' => isset($options['session'])
             ? (string) $options['session'] . (isset($options['continue']) ? ' (resume)' : '')
             : null,
+        'identity' => $userId . ($sendMetadata ? '' : ' (metadata off)'),
         'security' => $security !== null
             ? 'reviewer ' . $reviewerModel . ((bool) ($securityOptions['fail_closed'] ?? true) ? ' · fail-closed' : '')
             : 'off',
@@ -457,12 +493,28 @@ try {
             foreach ([
                 '/model [id|number]  Show or switch the model',
                 '/effort [level]     Show or switch the reasoning effort',
+                '/cache              Show identity, breakpoints and cache hit rate',
                 '/continue           Give unfinished work another step budget',
                 '/help               Show this command list',
                 'Ctrl+C              Exit the session',
             ] as $commandLine) {
                 $ui->info($commandLine);
             }
+        } elseif ($input === '/cache') {
+            $cacheTotals = $agent->usageTotals();
+            $ui->cacheReport([
+                'identity' => $userId,
+                'metadata' => $sendMetadata,
+                'cache_key' => $sendCacheKey,
+                'breakpoints' => 'system · tools' . ($conversationBreakpoint ? ' · last-message' : ''),
+                'ttl' => $cacheTtl,
+                'requests' => $cacheTotals['requests'],
+                'input' => $cacheTotals['input'],
+                'output' => $cacheTotals['output'],
+                'cache_read' => $cacheTotals['cache_read'],
+                'cache_creation' => $cacheTotals['cache_creation'],
+                'hit_ratio' => $agent->cacheHitRatio(),
+            ]);
         } elseif ($input === '/model' || str_starts_with($input, '/model ')) {
             $arg = trim(substr($input, 6));
             if (in_array(strtolower($arg), ['refresh', 'r'], true)) {

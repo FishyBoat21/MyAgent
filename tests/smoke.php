@@ -778,4 +778,95 @@ check($reviewDecision['verdict'] === 'allow', 'the reviewer did not allow the pr
 check($reviewProbe->efforts === [null], 'the reviewer inherited the actor effort');
 check($reviewProbe->effort() === 'max', 'the reviewer effort wrapper did not restore the effort');
 
+// --- Shared identity and prompt-cache breakpoints -----------------------------
+
+// The identity is one constant for the whole process, and the breakpoint on the
+// newest message must never leak into the stored conversation.
+$identityProbe = new class('unused') extends AnthropicClient {
+    /** @var list<array<string, mixed>> */
+    public array $bodies = [];
+    public string $reply = 'ok';
+    /** @param array<int, array<string, mixed>> $messages @param array<int, array<string, mixed>> $tools */
+    public function body(string $system, array $messages, array $tools = []): array
+    {
+        return $this->requestBody('probe-model', 8, $system, $messages, $tools);
+    }
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array
+    {
+        $this->bodies[] = $this->requestBody($model, $maxTokens, $system, $messages, $tools);
+        return ['content' => [['type' => 'text', 'text' => $this->reply]], 'stop_reason' => 'end_turn'];
+    }
+};
+$breakpointCount = static fn(array $body): int => substr_count((string) json_encode($body), '"cache_control"');
+$sharedMessages = [['role' => 'user', 'content' => 'hi']];
+
+$identityProbe->setUserId('myagent-test');
+check(($identityProbe->body('sys', $sharedMessages)['metadata']['user_id'] ?? null) === 'myagent-test', 'the shared user id is missing from the request body');
+check(!isset($identityProbe->body('sys', $sharedMessages)['prompt_cache_key']), 'prompt_cache_key was sent without being enabled');
+$identityProbe->setSendCacheKey(true);
+check(($identityProbe->body('sys', $sharedMessages)['prompt_cache_key'] ?? null) === 'myagent-test', 'the opt-in cache key was not sent');
+$identityProbe->setSendCacheKey(false);
+$identityProbe->setUserId(null);
+check(!isset($identityProbe->body('sys', $sharedMessages)['metadata']), 'metadata leaked with no user id');
+
+foreach (['bad id', str_repeat('a', 257), "a\nb", ''] as $badUserId) {
+    check(
+        str_contains(errorOf(static fn() => AnthropicClient::assertValidUserId($badUserId)), 'Invalid user id'),
+        'an invalid user id was accepted: ' . var_export($badUserId, true)
+    );
+}
+foreach (['myagent', 'myagent:v2', 'team@host.local'] as $goodUserId) {
+    AnthropicClient::assertValidUserId($goodUserId);
+}
+
+$identityProbe->setUserId('myagent-test');
+$toolsForBreakpoints = [['name' => 'probe', 'description' => 'd', 'input_schema' => ['type' => 'object', 'properties' => new stdClass()]]];
+check($breakpointCount($identityProbe->body('sys', $sharedMessages, $toolsForBreakpoints)) === 2, 'a first request must carry exactly the system and tools breakpoints');
+$identityProbe->setCacheTtl('1h');
+check(($identityProbe->body('sys', $sharedMessages)['system'][0]['cache_control']['ttl'] ?? null) === '1h', 'the 1h TTL is missing from the breakpoint');
+$identityProbe->setCacheTtl('5m');
+check(!isset($identityProbe->body('sys', $sharedMessages)['system'][0]['cache_control']['ttl']), 'the default breakpoint must not pin a TTL');
+check(str_contains(errorOf(static fn() => $identityProbe->setCacheTtl('2h')), 'cache.ttl'), 'an unsupported cache TTL was accepted');
+check(str_contains(errorOf(static fn() => $identityProbe->setCacheOptions(true, 'week')), 'cache.ttl'), 'setCacheOptions accepted an unsupported TTL');
+
+$identitySession = 'smoke-identity-' . getmypid();
+$identityStore = new SessionStore($root, $identitySession);
+$identitySessionFile = $root . '/.agent/sessions/' . $identitySession . '.json';
+try {
+    $identityProbe->bodies = [];
+    $identityProbe->setUserId('myagent-test');
+    $identityAgent = new Agent($identityProbe, $local, [], 'test', 100, 1, $identityStore);
+    $identityAgent->run('one');
+    $identityAgent->run('two');
+    check(count($identityProbe->bodies) === 2, 'expected two captured request bodies');
+    check(
+        ($identityProbe->bodies[0]['metadata']['user_id'] ?? null) === ($identityProbe->bodies[1]['metadata']['user_id'] ?? 'other'),
+        'the shared user id changed between turns'
+    );
+    check($breakpointCount($identityProbe->bodies[0]) === 2, 'the first turn must not add a conversation breakpoint');
+    check($breakpointCount($identityProbe->bodies[1]) === 3, 'the follow-up turn is missing the conversation breakpoint');
+    check($identityAgent->usageTotals()['requests'] === 2, 'usage requests were not counted');
+    check($identityAgent->cacheHitRatio() === 0.0, 'the hit ratio must be 0 without reported cache reads');
+    $savedIdentitySession = (string) file_get_contents($identitySessionFile);
+    check(!str_contains($savedIdentitySession, 'cache_control'), 'cache_control leaked into the session checkpoint');
+    check(!str_contains($savedIdentitySession, '"metadata"'), 'metadata leaked into the session checkpoint');
+} finally {
+    unset($identityStore);
+    @unlink($identitySessionFile);
+    @unlink($root . '/.agent/sessions/' . $identitySession . '.lock');
+}
+
+// The reviewer shares the actor's client, so it must carry the same identity.
+$identityProbe->bodies = [];
+$identityProbe->reply = $allowJson;
+$identityReviewer = new SecurityClassifier($identityProbe, 'reviewer', $root, ['audit_log' => '']);
+$identityDecision = $identityReviewer->review(
+    ['type' => 'tool_use', 'id' => 'identity-review', 'name' => 'write_file', 'input' => ['path' => 'tests/.identity-review.txt', 'content' => 'x']],
+    [],
+    $catalog
+);
+check($identityDecision['verdict'] === 'allow', 'the reviewer did not allow the identity probe');
+$reviewerBody = $identityProbe->bodies[array_key_last($identityProbe->bodies)] ?? [];
+check(($reviewerBody['metadata']['user_id'] ?? null) === 'myagent-test', 'the security reviewer did not inherit the shared user id');
+
 fwrite(STDOUT, "Smoke tests passed\n");

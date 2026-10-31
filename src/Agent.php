@@ -16,10 +16,25 @@ class AnthropicClient
     /** Canonical effort levels, ordered from cheapest to most thorough. */
     public const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
+    /** Supported prompt-cache breakpoint TTLs. */
+    public const CACHE_TTLS = ['5m', '1h'];
+
     private int $compactionThreshold = 0;
     private int $summaryMaxTokens = 2048;
     /** null means "omit output_config and let the provider choose". */
     private ?string $effort = null;
+    /**
+     * Identity sent with every request: the provider partitions its prompt
+     * cache on this value (measured: a different id misses entirely), so it
+     * is one shared constant per process and never per session.
+     */
+    private ?string $userId = null;
+    /** Also send an OpenAI-style top-level prompt_cache_key (opt-in). */
+    private bool $sendCacheKey = false;
+    /** Breakpoint TTL: "5m" (default) or "1h". */
+    private string $cacheTtl = '5m';
+    /** Mark the newest message so the next turn reuses the conversation. */
+    private bool $conversationBreakpoint = true;
     /** @var null|Closure(): void */
     private ?Closure $progress = null;
 
@@ -115,6 +130,114 @@ class AnthropicClient
     }
 
     /**
+     * Set the identity sent with every request. One value per process: the
+     * prompt cache is partitioned on it, so a per-session value would force a
+     * cold prefix in every session.
+     *
+     * @throws RuntimeException for a value that cannot be sent safely.
+     */
+    public function setUserId(?string $userId): void
+    {
+        if ($userId === null) {
+            $this->userId = null;
+            return;
+        }
+        self::assertValidUserId($userId);
+        $this->userId = $userId;
+    }
+
+    public function userId(): ?string
+    {
+        return $this->userId;
+    }
+
+    /** Send an OpenAI-style top-level prompt_cache_key as well (opt-in). */
+    public function setSendCacheKey(bool $send): void
+    {
+        $this->sendCacheKey = $send;
+    }
+
+    /**
+     * Prompt-cache behaviour: whether the newest message gets a breakpoint,
+     * and how long every breakpoint lives.
+     *
+     * @throws RuntimeException for an unsupported TTL.
+     */
+    public function setCacheOptions(bool $conversationBreakpoint, string $ttl = '5m'): void
+    {
+        $this->conversationBreakpoint = $conversationBreakpoint;
+        $this->setCacheTtl($ttl);
+    }
+
+    /** @throws RuntimeException for an unsupported TTL. */
+    public function setCacheTtl(string $ttl): void
+    {
+        $ttl = strtolower(trim($ttl));
+        if (!in_array($ttl, self::CACHE_TTLS, true)) {
+            throw new RuntimeException('cache.ttl must be "5m" or "1h"');
+        }
+        $this->cacheTtl = $ttl;
+    }
+
+    public function cacheTtl(): string
+    {
+        return $this->cacheTtl;
+    }
+
+    /** True when the newest message carries a cache breakpoint. */
+    public function hasConversationBreakpoint(): bool
+    {
+        return $this->conversationBreakpoint;
+    }
+
+    /** @throws RuntimeException when the id could not be sent safely. */
+    public static function assertValidUserId(string $userId): void
+    {
+        if (preg_match('/\A[A-Za-z0-9._:@+-]{1,256}\z/', $userId) !== 1) {
+            throw new RuntimeException('Invalid user id');
+        }
+    }
+
+    /** @return array<string, string> One prompt-cache breakpoint marker. */
+    private function cacheControl(): array
+    {
+        return $this->cacheTtl === '1h'
+            ? ['type' => 'ephemeral', 'ttl' => '1h']
+            : ['type' => 'ephemeral'];
+    }
+
+    /**
+     * Mark the end of the conversation so the next turn can reuse it.
+     *
+     * Works on a copy: the caller's messages - and therefore the session
+     * checkpoint - must never carry cache_control.
+     *
+     * @param array<int, array<string, mixed>> $messages
+     * @return array<int, array<string, mixed>>
+     */
+    private function withConversationBreakpoint(array $messages): array
+    {
+        // The first request of a session has nothing to reuse yet.
+        if (!$this->conversationBreakpoint || count($messages) < 2) {
+            return $messages;
+        }
+        $last = array_key_last($messages);
+        $message = $messages[$last];
+        if (is_string($message['content'] ?? null)) {
+            $message['content'] = [['type' => 'text', 'text' => (string) $message['content']]];
+        }
+        if (!is_array($message['content'] ?? null) || $message['content'] === []) {
+            return $messages;
+        }
+        $block = array_key_last($message['content']);
+        if (is_array($message['content'][$block])) {
+            $message['content'][$block]['cache_control'] = $this->cacheControl();
+            $messages[$last] = $message;
+        }
+        return $messages;
+    }
+
+    /**
      * Run a callback with effort omitted, then restore the previous setting.
      * The security reviewer shares this client with the actor but must never
      * inherit the actor's reasoning depth.
@@ -144,14 +267,26 @@ class AnthropicClient
      */
     protected function requestBody(string $model, int $maxTokens, string $system, array $messages, array $tools): array
     {
-        $body = ['model' => $model, 'max_tokens' => $maxTokens, 'messages' => $messages];
+        $body = [
+            'model' => $model,
+            'max_tokens' => $maxTokens,
+            'messages' => $this->withConversationBreakpoint($messages),
+        ];
+        if ($this->userId !== null) {
+            // Stable identity, identical in every session: the provider
+            // partitions its prompt cache on this value.
+            $body['metadata'] = ['user_id' => $this->userId];
+            if ($this->sendCacheKey) {
+                $body['prompt_cache_key'] = $this->userId;
+            }
+        }
         if ($system !== '') {
             // Stable prefix: cache the system prompt and the tool definitions.
-            $body['system'] = [['type' => 'text', 'text' => $system, 'cache_control' => ['type' => 'ephemeral']]];
+            $body['system'] = [['type' => 'text', 'text' => $system, 'cache_control' => $this->cacheControl()]];
         }
         if ($tools !== []) {
             $tools = array_values($tools);
-            $tools[count($tools) - 1]['cache_control'] = ['type' => 'ephemeral'];
+            $tools[count($tools) - 1]['cache_control'] = $this->cacheControl();
             $body['tools'] = $tools;
         }
         if ($this->effort !== null) {
@@ -169,6 +304,10 @@ class AnthropicClient
     {
         $body = $this->requestBody($model, $maxTokens, $system, $messages, $tools);
         $betas = [];
+        if ($this->cacheTtl === '1h') {
+            // Extended-TTL breakpoints; harmless where the provider ignores it.
+            $betas[] = 'extended-cache-ttl-2025-04-11';
+        }
         $approxChars = strlen($system) + strlen((string) json_encode($messages, JSON_INVALID_UTF8_SUBSTITUTE));
         if ($this->compactionThreshold > 0 && $approxChars >= $this->compactionThreshold) {
             $body['context_management'] = ['edits' => [['type' => 'compact_20260112', 'summary_max_tokens' => $this->summaryMaxTokens]]];
@@ -917,8 +1056,22 @@ final class Agent
     private array $mcpByAlias = [];
     /** Mirrors AnthropicClient::effort() for checkpoints and the banner. */
     private ?string $effort = null;
+    /**
+     * Identity sent with every request: the provider partitions its prompt
+     * cache on this value (measured: a different id misses entirely), so it
+     * is one shared constant per process and never per session.
+     */
+    private ?string $userId = null;
+    /** Also send an OpenAI-style top-level prompt_cache_key (opt-in). */
+    private bool $sendCacheKey = false;
+    /** Breakpoint TTL: "5m" (default) or "1h". */
+    private string $cacheTtl = '5m';
+    /** Mark the newest message so the next turn reuses the conversation. */
+    private bool $conversationBreakpoint = true;
     /** Maximum bytes kept from one tool result; larger output is spilled to a temp file. 0 disables the cap. */
     private int $toolResultLimit = 100000;
+    /** @var array{requests:int,input:int,output:int,cache_read:int,cache_creation:int} */
+    private array $usageTotals = ['requests' => 0, 'input' => 0, 'output' => 0, 'cache_read' => 0, 'cache_creation' => 0];
 
     /** @param McpClient[] $mcp */
     public function __construct(
@@ -976,6 +1129,39 @@ final class Agent
     public function effort(): ?string
     {
         return $this->effort;
+    }
+
+    /**
+     * Cumulative actor usage for this process. Security-reviewer calls are
+     * deliberately excluded: they never reach run(), and their prompt is a
+     * constant, so they self-cache; mixing them in would hide the actor number.
+     *
+     * @return array{requests:int,input:int,output:int,cache_read:int,cache_creation:int}
+     */
+    public function usageTotals(): array
+    {
+        return $this->usageTotals;
+    }
+
+    /** Share of billable input tokens served from the prompt cache (0.0 before the first call). */
+    public function cacheHitRatio(): float
+    {
+        $denominator = $this->usageTotals['input'] + $this->usageTotals['cache_read'] + $this->usageTotals['cache_creation'];
+        return $denominator > 0 ? $this->usageTotals['cache_read'] / $denominator : 0.0;
+    }
+
+    /** @param array<string, mixed> $usage */
+    private function recordUsage(array $usage): void
+    {
+        $this->usageTotals['requests']++;
+        foreach ([
+            'input_tokens' => 'input',
+            'output_tokens' => 'output',
+            'cache_read_input_tokens' => 'cache_read',
+            'cache_creation_input_tokens' => 'cache_creation',
+        ] as $key => $slot) {
+            $this->usageTotals[$slot] += (int) ($usage[$key] ?? 0);
+        }
     }
 
     /** Set the acting effort; null omits output_config for the next request. */
@@ -1126,7 +1312,9 @@ final class Agent
             }
 
             $stopReason = (string) ($response['stop_reason'] ?? 'end_turn');
-            $this->terminal->usage((array) ($response['usage'] ?? []), $modelDuration, $stopReason);
+            $usage = (array) ($response['usage'] ?? []);
+            $this->recordUsage($usage);
+            $this->terminal->usage($usage, $modelDuration, $stopReason);
             if ($stopReason === 'pause_turn') {
                 $this->checkpoint(true, []);
                 continue;

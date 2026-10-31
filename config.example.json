@@ -7,6 +7,15 @@
   "api_key_header": "x-api-key",
   "api_key_prefix": "",
   "api_version": "2023-06-01",
+  "identity": {
+    "user_id": "myagent",
+    "send_metadata": true,
+    "prompt_cache_key": false
+  },
+  "cache": {
+    "conversation_breakpoint": true,
+    "ttl": "5m"
+  },
   "models_url": "",
   "models_auth": "bearer",
   "models_cache_ttl": 86400,

@@ -217,6 +217,7 @@ final class Terminal
             'effort' => 'effort',
             'workspace' => 'workspace',
             'session' => 'session',
+            'identity' => 'identity',
             'security' => 'security',
             'tools' => 'tools',
             'mcp' => 'mcp',
@@ -387,6 +388,28 @@ final class Terminal
         foreach (Ansi::wrap($line, $this->width()) as $wrapped) {
             $this->err($this->themeErr->style($wrapped, 'muted') . "\n");
         }
+    }
+
+    /**
+     * Identity, cache breakpoints and measured hit rate for the /cache command.
+     *
+     * @param array{identity:string,metadata:bool,cache_key:bool,breakpoints:string,ttl:string,
+     *              requests:int,input:int,output:int,cache_read:int,cache_creation:int,hit_ratio:float} $report
+     */
+    public function cacheReport(array $report): void
+    {
+        $flags = $report['metadata'] ? 'metadata on' : 'metadata off';
+        if ($report['cache_key']) {
+            $flags .= ' · cache key on';
+        }
+        $this->info('identity    ' . $report['identity'] . ' (shared by every session) · ' . $flags);
+        $this->info('breakpoints ' . $report['breakpoints'] . ' · ttl ' . $report['ttl']);
+        $percent = rtrim(rtrim(number_format($report['hit_ratio'] * 100, 1, '.', ''), '0'), '.');
+        $this->info('usage       ' . $report['requests'] . ' request' . ($report['requests'] === 1 ? '' : 's')
+            . ' · ' . $this->formatTokens($report['input']) . ' in'
+            . ' · ' . $this->formatTokens($report['cache_read']) . ' cached (' . ($percent === '' ? '0' : $percent) . '% hit)'
+            . ' · ' . $this->formatTokens($report['cache_creation']) . ' written'
+            . ' · ' . $this->formatTokens($report['output']) . ' out');
     }
 
     /** @param array<string, mixed> $call @param array<string, mixed> $decision */
