@@ -31,9 +31,16 @@ final class AskUser
      * @param null|Closure(): ?string $readLine Reads one line; null means no interactive user.
      * @param null|Closure(string): void $write Writes prompt text; defaults to STDERR.
      * @param null|Terminal $terminal Optional renderer for styled prompts.
+     * @param null|Closure(string,list<string>): ?string $onAsk Bridge hook. Receives the raw question
+     *        and the validated 1-4 options. Returning a string uses it as the answer; returning null
+     *        falls back to the terminal flow. Throwing aborts with that message.
      */
-    public function __construct(?Closure $readLine = null, ?Closure $write = null, ?Terminal $terminal = null)
-    {
+    public function __construct(
+        ?Closure $readLine = null,
+        ?Closure $write = null,
+        ?Terminal $terminal = null,
+        private ?Closure $onAsk = null,
+    ) {
         $this->readLine = $readLine;
         $this->terminal = $terminal;
         if ($write !== null) {
@@ -93,6 +100,12 @@ final class AskUser
         }
         if ($choices === [] || count($choices) > self::MAX_OPTIONS) {
             throw new RuntimeException('ask_user requires between 1 and 4 options.');
+        }
+        if ($this->onAsk !== null) {
+            $answer = ($this->onAsk)($question, $choices);
+            if ($answer !== null) {
+                return self::oneLine($answer);
+            }
         }
         if ($this->readLine === null) {
             throw new RuntimeException('ask_user is unavailable: no interactive terminal is attached. State the question in your final answer instead.');

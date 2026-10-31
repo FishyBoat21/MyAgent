@@ -36,6 +36,9 @@ final class Terminal
     private bool $plain;
     private bool $cursorHidden = false;
     private bool $progressActive = false;
+    /** @var array<string, list<string>> Tool-call ids in flight, keyed by tool name. */
+    private array $toolIds = [];
+    private int $toolSeq = 0;
 
     public function __construct(
         private bool $outTty,
@@ -43,6 +46,8 @@ final class Terminal
         array $options = [],
         ?Closure $out = null,
         ?Closure $err = null,
+        /** @var null|Closure(string,array): void */
+        private ?Closure $events = null,
     ) {
         $this->plain = (bool) ($options['plain'] ?? false);
         $this->options = array_merge(self::DEFAULTS, $options);
@@ -116,6 +121,56 @@ final class Terminal
             'usage' => false,
             'width' => 100,
         ]);
+    }
+
+    /**
+     * Machine-facing renderer: no ANSI, no bytes on STDOUT/STDERR, events only.
+     *
+     * @param Closure(string,array): void $events
+     */
+    public static function bridge(Closure $events, int $maxEventBytes = 32768): self
+    {
+        return new self(
+            false,
+            false,
+            [
+                'plain' => true,
+                'color' => 'never',
+                'unicode' => 'never',
+                'markdown' => false,
+                'spinner' => false,
+                'banner' => false,
+                'usage' => false,
+                'width' => 100,
+                'event_max_bytes' => $maxEventBytes,
+            ],
+            static function (string $text): void {
+            },
+            static function (string $text): void {
+            },
+            $events,
+        );
+    }
+
+    /** Forward one structured event to the machine-facing sink, if any. */
+    private function emitEvent(string $type, array $payload = []): void
+    {
+        if ($this->events !== null) {
+            ($this->events)($type, $payload);
+        }
+    }
+
+    /** @return array{0: string, 1: bool, 2: int} [text, truncated, trueByteLength] */
+    private function capEventText(string $text): array
+    {
+        $bytes = strlen($text);
+        $limit = max(1024, (int) ($this->options['event_max_bytes'] ?? 32768));
+        if ($bytes <= $limit) {
+            return [$text, false, $bytes];
+        }
+        $prefix = function_exists('mb_strcut') ? mb_strcut($text, 0, $limit, 'UTF-8') : substr($text, 0, $limit);
+
+        return [$prefix, true, $bytes];
     }
 
     public function width(): int
@@ -270,6 +325,7 @@ final class Terminal
 
     public function assistant(string $markdown): void
     {
+        $this->emitEvent('assistant', ['text' => $markdown]);
         if (trim($markdown) === '') {
             return;
         }
@@ -301,6 +357,9 @@ final class Terminal
     /** @param array<string, mixed> $input */
     public function toolStart(string $name, array $input): void
     {
+        $toolId = 't' . (++$this->toolSeq);
+        $this->toolIds[$name][] = $toolId;
+        $this->emitEvent('tool_start', ['id' => $toolId, 'name' => $name, 'input' => $input]);
         $details = (string) $this->options['tool_details'];
         if ($details === 'hidden') {
             return;
@@ -320,6 +379,21 @@ final class Terminal
     /** @param array<string, mixed> $input */
     public function toolResult(string $name, array $input, string $result, bool $isError, float $duration): void
     {
+        $toolId = null;
+        if (($this->toolIds[$name] ?? []) !== []) {
+            $toolId = array_pop($this->toolIds[$name]);
+        }
+        [$eventText, $eventTruncated, $eventBytes] = $this->capEventText($result);
+        $this->emitEvent('tool_result', [
+            'id' => $toolId,
+            'name' => $name,
+            'input' => $input,
+            'result' => $eventText,
+            'result_truncated' => $eventTruncated,
+            'result_bytes' => $eventBytes,
+            'is_error' => $isError,
+            'duration' => round($duration, 4),
+        ]);
         $content = Ansi::sanitize($result);
         $firstLine = $this->firstLine($content);
         $details = (string) $this->options['tool_details'];
@@ -369,6 +443,14 @@ final class Terminal
     /** @param array<string, mixed> $usage */
     public function usage(array $usage, float $duration, string $stopReason): void
     {
+        $this->emitEvent('usage', [
+            'input' => (int) ($usage['input_tokens'] ?? 0),
+            'output' => (int) ($usage['output_tokens'] ?? 0),
+            'cache_read' => (int) ($usage['cache_read_input_tokens'] ?? 0),
+            'cache_creation' => (int) ($usage['cache_creation_input_tokens'] ?? 0),
+            'duration' => round($duration, 4),
+            'stop_reason' => $stopReason,
+        ]);
         if ($this->plain || !$this->errTty || !(bool) $this->options['usage']) {
             return;
         }
@@ -398,6 +480,7 @@ final class Terminal
      */
     public function cacheReport(array $report): void
     {
+        $this->emitEvent('cache', ['report' => $report]);
         $flags = $report['metadata'] ? 'metadata on' : 'metadata off';
         if ($report['cache_key']) {
             $flags .= ' · cache key on';
@@ -470,6 +553,7 @@ final class Terminal
     /** @param array<string, mixed> $decision */
     public function securityDenied(array $decision): void
     {
+        $this->emitEvent('security_denied', ['decision' => $decision]);
         $verdict = Ansi::sanitize((string) ($decision['verdict'] ?? 'deny'));
         $risk = Ansi::sanitize((string) ($decision['risk'] ?? 'high'));
         $category = Ansi::sanitize((string) ($decision['category'] ?? 'other'));
@@ -487,6 +571,7 @@ final class Terminal
 
     public function securityResolved(bool $approved): void
     {
+        $this->emitEvent('security_resolved', ['approved' => $approved]);
         if ($this->plain || !$this->errTty) {
             return;
         }
@@ -497,16 +582,19 @@ final class Terminal
 
     public function info(string $text): void
     {
+        $this->emitEvent('info', ['text' => $text]);
         $this->status('info', 'muted', $text);
     }
 
     public function warning(string $text): void
     {
+        $this->emitEvent('warning', ['text' => $text]);
         $this->status('warning', 'warn', $text);
     }
 
     public function error(string $text): void
     {
+        $this->emitEvent('error', ['text' => $text]);
         $this->status('error', 'error', $text);
     }
 

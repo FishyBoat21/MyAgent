@@ -12,6 +12,7 @@ require $autoload;
 use MyAgent\Agent;
 use MyAgent\AnthropicClient;
 use MyAgent\AskUser;
+use MyAgent\Bridge;
 use MyAgent\LocalTools;
 use MyAgent\McpClient;
 use MyAgent\ModelCatalog;
@@ -22,8 +23,12 @@ use MyAgent\SessionStore;
 use MyAgent\Terminal;
 
 $root = getcwd();
-$options = getopt('', ['config:', 'model:', 'effort:', 'user-id:', 'max-steps:', 'command-timeout:', 'tool-result-limit:', 'session:', 'continue', 'help', 'plain', 'no-color', 'width:', 'no-banner', 'tool-details:', 'list-models', 'refresh-models']);
+$options = getopt('', ['config:', 'model:', 'effort:', 'user-id:', 'max-steps:', 'command-timeout:', 'tool-result-limit:', 'session:', 'continue', 'help', 'plain', 'no-color', 'width:', 'no-banner', 'tool-details:', 'list-models', 'refresh-models', 'bridge', 'bridge-max-event-bytes:']);
 $plain = isset($options['plain']);
+// Machine mode: stdout becomes JSONL events, stdin a JSONL command channel.
+$bridge = isset($options['bridge'])
+    ? new Bridge((int) ($options['bridge-max-event-bytes'] ?? 32768))
+    : null;
 
 if (isset($options['help'])) {
     $help = Terminal::detect([], $plain);
@@ -46,6 +51,8 @@ if (isset($options['help'])) {
     $help->out("  --width=N               Force terminal width (40-200)\n");
     $help->out("  --no-banner             Hide the startup banner\n");
     $help->out("  --tool-details=MODE     summary|full|hidden (default: summary)\n");
+    $help->out("  --bridge                Machine mode: JSONL events on stdout, JSONL commands on stdin\n");
+    $help->out("  --bridge-max-event-bytes=N  Cap a single bridge event (default 32768)\n");
     $help->out("  --help                  Show this help\n");
     $help->out("\nInteractive commands:\n");
     $help->out("  /model [id|number]      Show or switch the model\n");
@@ -258,7 +265,7 @@ try {
     }
 
     $skills = new Skills($root);
-    $isTty = @stream_isatty(STDIN);
+    $isTty = $bridge === null ? @stream_isatty(STDIN) : false;
     $inputStream = STDIN;
     // Reads one terminal line. In a terminal, end-of-input (Ctrl+D, or
     // Ctrl+Z then Enter on Windows) never ends the session: the console
@@ -282,8 +289,17 @@ try {
         }
         return null;
     };
-    $askUser = $isTty ? new AskUser($readLine, null, $ui) : new AskUser();
-    $selector = $isTty ? new ModelSelector($readLine, null, $ui) : new ModelSelector();
+    if ($bridge !== null) {
+        // Bridge mode: the renderer emits events instead of bytes, and ask_user
+        // is wired to the JSONL channel so the tool stays advertised.
+        $ui = Terminal::bridge($bridge->emitter(), (int) ($options['bridge-max-event-bytes'] ?? 32768));
+        $readLine = $bridge->reader();
+        $askUser = new AskUser($readLine, null, null, $bridge->askHook());
+        $selector = new ModelSelector();
+    } else {
+        $askUser = $isTty ? new AskUser($readLine, null, $ui) : new AskUser();
+        $selector = $isTty ? new ModelSelector($readLine, null, $ui) : new ModelSelector();
+    }
     $local = new LocalTools($root, $skills, $commandTimeout, $askUser);
     $store = isset($options['session']) ? new SessionStore($root, (string) $options['session']) : null;
 
@@ -310,6 +326,7 @@ try {
 
     $mcp = [];
     $mcpStatuses = [];
+    $mcpNames = [];
     if (!is_array($config['mcpServers'] ?? [])) {
         throw new RuntimeException('mcpServers must be an object');
     }
@@ -321,6 +338,7 @@ try {
         try {
             $client->connect();
             $mcp[] = $client;
+            $mcpNames[] = (string) $name;
             $mcpStatuses[] = ['ok', (string) $name, count($client->definitions())];
         } catch (Throwable $e) {
             $client->close();
@@ -351,7 +369,10 @@ try {
             $reviewerModel = (string) $model;
         }
         $approver = null;
-        if ($isTty) {
+        if ($bridge !== null) {
+            // Every "ask" verdict becomes a UI approval card; a timeout denies.
+            $approver = $bridge->approver();
+        } elseif ($isTty) {
             $approver = static function (array $call, array $decision) use ($readLine, $ui): bool {
                 $ui->securityApproval($call, $decision);
                 $line = $readLine();
@@ -364,6 +385,92 @@ try {
     $agent = new Agent($api, $local, $mcp, (string) $model, $maxTokens, $maxSteps, $store, $compactionThreshold, $summaryMaxTokens, $security, $ui);
     $agent->setToolResultLimit($toolResultLimit);
 
+    if ($bridge !== null) {
+        $agent->setProgressHook($bridge->progressHook());
+        $bridge->emit('ready', [
+            'session' => isset($options['session']) ? (string) $options['session'] : null,
+            'workspace' => $root,
+            'model' => (string) $model,
+            'effort' => $effort,
+            'identity' => $userId,
+            'security' => $security === null
+                ? ['enabled' => false]
+                : [
+                    'enabled' => true,
+                    'model' => $reviewerModel,
+                    'fail_closed' => (bool) ($securityOptions['fail_closed'] ?? true),
+                ],
+            'tools' => count($local->definitions()),
+            'mcp' => $mcpNames,
+            'pid' => getmypid(),
+            'ask_user' => $askUser->available(),
+        ]);
+
+        $byeReason = 'idle-exit';
+        while (($command = $bridge->nextCommand()) !== null) {
+            $commandType = (string) ($command['type'] ?? '');
+            if ($commandType === 'prompt') {
+                $text = (string) ($command['text'] ?? '');
+                if (trim($text) === '') {
+                    $bridge->emit('warning', ['text' => 'empty prompt ignored']);
+                    continue;
+                }
+                $bridge->emit('turn_start', ['prompt' => $text]);
+                $complete = $agent->run($text);
+                $bridge->emit('turn_end', ['complete' => $complete]);
+                if (!$complete) {
+                    $bridge->emit('warning', ['text' => 'Step limit reached with work in progress. Send continue for another budget.']);
+                }
+            } elseif ($commandType === 'continue') {
+                $bridge->emit('turn_start', ['prompt' => null]);
+                $complete = $agent->resume();
+                $bridge->emit('turn_end', ['complete' => $complete]);
+            } elseif ($commandType === 'set_model') {
+                try {
+                    $agent->setModel((string) ($command['model'] ?? ''));
+                    $bridge->emit('model', ['model' => $agent->model()]);
+                } catch (Throwable $e) {
+                    $bridge->emit('error', ['text' => $e->getMessage()]);
+                }
+            } elseif ($commandType === 'set_effort') {
+                try {
+                    $requested = $command['effort'] ?? null;
+                    $agent->setEffort(is_string($requested) && trim($requested) !== '' ? $requested : null);
+                    $bridge->emit('effort', ['effort' => $agent->effort()]);
+                } catch (Throwable $e) {
+                    $bridge->emit('error', ['text' => $e->getMessage()]);
+                }
+            } elseif ($commandType === 'cache_report') {
+                $cacheTotals = $agent->usageTotals();
+                $bridge->emit('cache', ['report' => [
+                    'identity' => $userId,
+                    'metadata' => $sendMetadata,
+                    'cache_key' => $sendCacheKey,
+                    'breakpoints' => 'system · tools' . ($conversationBreakpoint ? ' · last-message' : ''),
+                    'ttl' => $cacheTtl,
+                    'requests' => $cacheTotals['requests'],
+                    'input' => $cacheTotals['input'],
+                    'output' => $cacheTotals['output'],
+                    'cache_read' => $cacheTotals['cache_read'],
+                    'cache_creation' => $cacheTotals['cache_creation'],
+                    'hit_ratio' => $agent->cacheHitRatio(),
+                ]]);
+            } elseif ($commandType === 'shutdown') {
+                $byeReason = 'shutdown';
+                break;
+            } elseif (in_array($commandType, ['answer', 'cancel', 'verdict'], true)) {
+                $bridge->emit('warning', ['text' => 'stale ' . $commandType . ' ignored: no interaction is pending']);
+            } else {
+                $bridge->emit('warning', ['text' => 'unknown command: ' . $commandType]);
+            }
+        }
+
+        $bridge->emit('bye', ['reason' => $byeReason, 'code' => 0]);
+        foreach ($mcp as $client) {
+            $client->close();
+        }
+        exit(0);
+    }
     $bannerShown = $ui->banner([
         'model' => (string) $model,
         'effort' => $effort ?? 'provider default',
@@ -613,6 +720,9 @@ try {
         $ui->error("Error: {$e->getMessage()}");
     } else {
         fwrite(STDERR, "Error: {$e->getMessage()}\n");
+    }
+    if ($bridge !== null) {
+        $bridge->emit('bye', ['reason' => 'error', 'code' => 1]);
     }
     exit(1);
 }

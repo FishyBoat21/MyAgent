@@ -1070,6 +1070,8 @@ final class Agent
     private bool $conversationBreakpoint = true;
     /** Maximum bytes kept from one tool result; larger output is spilled to a temp file. 0 disables the cap. */
     private int $toolResultLimit = 100000;
+    /** @var null|Closure(): void Extra progress sink for headless (bridge) runs; the spinner is off there. */
+    private ?Closure $progressHook = null;
     /** @var array{requests:int,input:int,output:int,cache_read:int,cache_creation:int} */
     private array $usageTotals = ['requests' => 0, 'input' => 0, 'output' => 0, 'cache_read' => 0, 'cache_creation' => 0];
 
@@ -1186,6 +1188,17 @@ final class Agent
         $this->toolResultLimit = $chars;
     }
 
+    /**
+     * Install a progress sink that survives the per-step spinner reset. Used by
+     * the machine bridge, where no spinner exists but the UI still wants ticks.
+     *
+     * @param null|Closure(): void $hook
+     */
+    public function setProgressHook(?Closure $hook): void
+    {
+        $this->progressHook = $hook;
+    }
+
     public function run(string $prompt): bool
     {
         $this->messages[] = ['role' => 'user', 'content' => $prompt];
@@ -1268,7 +1281,7 @@ final class Agent
             $started = microtime(true);
             $spinner = $this->terminal->spinner('Thinking');
             $spinner?->start();
-            $this->api->setProgressCallback($spinner === null ? null : static fn() => $spinner->tick());
+            $this->api->setProgressCallback($this->progressHook ?? ($spinner === null ? null : static fn() => $spinner->tick()));
             try {
                 $response = $this->api->message($this->model, $this->maxTokens, $system, $this->messages, $tools);
             } finally {

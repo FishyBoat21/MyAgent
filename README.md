@@ -297,9 +297,58 @@ Configure servers in `config.json`:
 
 The agent starts each process in the working directory, performs the MCP `2025-11-25` initialize handshake, discovers all `tools/list` pages, then calls `tools/call` as requested. Server tools appear to Anthropic with an `mcp_` prefix and a unique suffix. A failed server is reported and skipped; other servers and local tools remain available. Keep secrets in environment variables; `${NAME}` in an MCP `env` value is expanded from the parent environment. This client supports the 2025-era stdio handshake and tool calls, not MCP resources, prompts, sampling, or the newer stateless lifecycle.
 
+## Machine mode (`--bridge`)
+
+`--bridge` turns the process into a supervisor-friendly worker (used by
+[MyAgentManager](../MyAgentManager)): STDOUT becomes a JSONL event stream and STDIN a
+JSONL command channel. There is no banner, no ANSI and no prose on STDOUT — the
+renderer discards its byte writers entirely — and a TTY is never trusted in this
+mode, so behaviour is identical whether or not one is attached.
+
+```sh
+php agent.php --bridge --session=alpha-abc123 --model=deepseek-flash --max-steps=20
+echo {"type":"prompt","text":"Reply with the single word PONG"} | php agent.php --bridge --session=smoke
+```
+
+Every line in both directions is one JSON object carrying `"v":1`. A receiver must
+reject another version: the bridge answers
+`{"v":1,"type":"error","text":"unsupported protocol version"}` and exits with code 3.
+
+**STDOUT (child → supervisor)**
+
+| Type | Payload |
+|---|---|
+| `ready` | `session, workspace, model, effort, identity, security{model,fail_closed,enabled}, tools, mcp[], pid, ask_user` |
+| `turn_start` / `turn_end` | `prompt` (null for a resume) / `complete` (false = step limit) |
+| `assistant` | `text` — raw Markdown |
+| `tool_start` / `tool_result` | `id, name, input` / `+ result, result_truncated, result_bytes, is_error, duration` |
+| `usage` | `input, output, cache_read, cache_creation, duration, stop_reason` |
+| `info` / `warning` / `error` | `text` |
+| `cache` | `report` — the same object `/cache` renders |
+| `security_denied` / `security_resolved` | `decision` / `approved` |
+| `progress` | `elapsed, bytes` (at most 1 Hz) |
+| `model` / `effort` | the value now in effect |
+| `question` / `question_closed` | `id, question, options[]` / `id, reason` |
+| `approval` / `approval_closed` | `id, tool, input, decision` / `id, verdict` |
+| `bye` | `reason, code` |
+
+**STDIN (supervisor → child)**: `prompt`, `continue`, `answer`, `cancel`, `verdict`,
+`set_model`, `set_effort`, `cache_report`, `shutdown`.
+
+In bridge mode `ask_user` stays advertised (`"ask_user": true` in `ready`) because the
+bridge installs a non-null reader: questions are asked over the command channel and
+answered by the supervisor. A security-reviewer `ask` verdict likewise becomes an
+`approval` event instead of a `[y/N]` prompt, so an unattended session can still be
+approved or denied. `--bridge-max-event-bytes=N` caps a single emitted tool result
+(default 32768; `result_bytes` still reports the true length).
+
+Nothing else changes: prompts, tool schemas, request bodies, session checkpoints,
+the security policy and token/cache behaviour are byte-identical to a normal run.
+Without `--bridge`, MyAgent behaves exactly as before.
+
 ## Verify
 
-Run `composer test` (equivalently, `php tests/smoke.php`). The smoke test checks local skills and files, starts the bundled stdio MCP example, and exercises tool use, session recovery, compaction handling, the `ask_user` prompt with scripted input, and the security reviewer with fake Anthropic responses. It also runs `tests/ui.php`, which covers ANSI sanitizing, width/wrapping, Markdown rendering, tool summaries, plain-mode compatibility, and the styled/plain agent output paths, and `tests/selector.php`, which covers model/effort catalog normalization, clamping, request-body construction, reviewer effort isolation, and the scripted pickers. It does not make a paid API request.
+Run `composer test` (equivalently, `php tests/smoke.php && php tests/bridge.php`). The smoke test checks local skills and files, starts the bundled stdio MCP example, and exercises tool use, session recovery, compaction handling, the `ask_user` prompt with scripted input, and the security reviewer with fake Anthropic responses. It also runs `tests/ui.php`, which covers ANSI sanitizing, width/wrapping, Markdown rendering, tool summaries, plain-mode compatibility, and the styled/plain agent output paths, `tests/selector.php`, which covers model/effort catalog normalization, clamping, request-body construction, reviewer effort isolation, and the scripted pickers, and `tests/bridge.php`, which covers the `--bridge` event mapping, the `ask_user` approval/answer hooks, result capping, protocol-version rejection and progress throttling. It does not make a paid API request.
 
 `php tests/render-demo.php --force --color=always --width=100` prints the visual gallery
 (banner, Markdown, tables, code, tool cards, security prompts, `ask_user`) for manual review.

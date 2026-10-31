@@ -17,7 +17,8 @@
         ]
     },
     "scripts": {
-        "test": "@php tests/smoke.php",
+        "test": "@php tests/smoke.php && @php tests/bridge.php",
+        "test:bridge": "@php tests/bridge.php",
         "test:ui": "@php tests/ui.php",
         "test:selector": "@php tests/selector.php",
         "demo": "@php tests/render-demo.php --force --color=always --width=100"
