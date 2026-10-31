@@ -12,11 +12,11 @@ Composer manages autoloading and the test scripts. There are no third-party runt
    composer install
    ```
 
-2. Copy `config.example.json` to `config.json` and edit it. Remove the example MCP server if you do not need it.
+2. Copy `config.example.json` to `config.json` **next to `agent.php`** and edit it. Remove the example MCP server if you do not need it. The agent always reads this file from its own folder, so it can be launched from any working directory; the working directory only determines what the agent operates on.
 2. Set `"api_key"` in `config.json`, or leave it empty and set `ANTHROPIC_API_KEY` in your environment. A non-empty `api_key` wins; `api_key_env` names the fallback variable (default `ANTHROPIC_API_KEY`; set it to `""` to require the config key only).
 3. Run `php agent.php "Inspect this project and summarize it"` to open a session with that first task, or `php agent.php` for an empty interactive session. `composer` itself is only needed to install/refresh the autoloader; the agent runs directly with `php`. A finished answer never closes the session: type the next instruction at the `you>` prompt. In a terminal, only `Ctrl+C` ends the process; `/exit` and `/quit` do not exist.
 
-Use `--config=path`, `--model=MODEL`, `--effort=LEVEL`, `--max-steps=N`, or `--command-timeout=N` to override settings. The model defaults to `config.model`; see [Models and effort](#models-and-effort). Each model request waits for a complete response before tools run.
+Use `--config=path`, `--model=MODEL`, `--effort=LEVEL`, `--max-steps=N`, or `--command-timeout=N` to override settings. Without `--config`, the agent reads `config.json` from the folder containing `agent.php` — not from the working directory. An explicit `--config` path is used as given, so a relative path resolves against the working directory. The model defaults to `config.model`; see [Models and effort](#models-and-effort). Each model request waits for a complete response before tools run.
 
 ## Models and effort
 

@@ -30,7 +30,7 @@ if (isset($options['help'])) {
     $help->heading('MyAgent — PHP CLI coding agent');
     $help->out("Usage: php agent.php [options] [prompt...]\n\n");
     $help->out("Options:\n");
-    $help->out("  --config=FILE           Config file (default: config.json)\n");
+    $help->out("  --config=FILE           Config file (default: config.json next to agent.php)\n");
     $help->out("  --model=MODEL           Override the model (default: config.model)\n");
     $help->out("  --effort=LEVEL          low|medium|high|xhigh|max; omit for provider default\n");
     $help->out("  --list-models           Print the provider's model catalog and exit\n");
@@ -60,7 +60,11 @@ if (isset($options['help'])) {
 $ui = null;
 
 try {
-    $configPath = $options['config'] ?? 'config.json';
+    // The default config lives next to agent.php, not in the working
+    // directory: the agent can be launched from any project while still
+    // reading its own provider settings. An explicit --config is used as
+    // given (relative paths resolve against the working directory).
+    $configPath = $options['config'] ?? __DIR__ . '/config.json';
     $config = [];
     if (is_file($configPath)) {
         $config = json_decode((string) file_get_contents($configPath), true, 512, JSON_THROW_ON_ERROR);
