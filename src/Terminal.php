@@ -214,6 +214,7 @@ final class Terminal
 
         $labels = [
             'model' => 'model',
+            'effort' => 'effort',
             'workspace' => 'workspace',
             'session' => 'session',
             'security' => 'security',
@@ -230,7 +231,7 @@ final class Terminal
         }
 
         $width = min($this->width(), 100);
-        $hint = 'Type a task. /continue resumes unfinished work. Ctrl+C exits.';
+        $hint = 'Type a task. /model and /effort change the run. /continue resumes. Ctrl+C exits.';
 
         if ($width < 60) {
             $lines = ['MyAgent'];

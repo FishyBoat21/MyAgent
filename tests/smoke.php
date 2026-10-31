@@ -14,6 +14,7 @@ use MyAgent\AnthropicClient;
 use MyAgent\AskUser;
 use MyAgent\LocalTools;
 use MyAgent\McpClient;
+use MyAgent\ModelCatalog;
 use MyAgent\SecurityClassifier;
 use MyAgent\Skills;
 use MyAgent\SessionStore;
@@ -69,6 +70,8 @@ function errorOf(callable $run): string
     }
     throw new RuntimeException('Expected a RuntimeException');
 }
+
+require __DIR__ . '/selector.php';
 
 $rendered = '';
 $askLocal = new LocalTools($root, $skills, 300, $scripted(['2'], $rendered));
@@ -509,5 +512,185 @@ $uiErr = '';
 (new Agent($toolActor, $local, [], 'test', 100, 2, null, 24000, 2048, null, $ui))->run('Read a missing file');
 check(str_contains(Ansi::strip($uiErr), 'read_file'), 'tool activity missing from styled output');
 check(str_contains(Ansi::strip($uiErr), 'Not found'), 'tool error summary missing from styled output');
+
+// --- Model catalog and effort ------------------------------------------------
+
+$deepseekPayload = ['object' => 'list', 'data' => [
+    [
+        'id' => 'deepseek-flash',
+        'object' => 'model',
+        'name' => 'DeepSeek-V4.1-Flash',
+        'context_window' => 1048576,
+        'max_output_tokens' => 393216,
+        'effort' => ['supported_levels' => ['high', 'low', 'max'], 'default_level' => 'high'],
+        'ignored' => true,
+    ],
+    [
+        'id' => 'deepseek-v4-pro',
+        'name' => 'DeepSeek-V4-Pro',
+        'context_window' => 1048576,
+        'max_output_tokens' => 393216,
+        'effort' => ['supported_levels' => ['low', 'high', 'max'], 'default_level' => 'high'],
+    ],
+    ['id' => ''],
+    ['name' => 'missing id'],
+    ['id' => 'deepseek-flash', 'name' => 'duplicate'],
+]];
+$normalized = ModelCatalog::normalize($deepseekPayload);
+check(count($normalized) === 2, 'catalog did not drop or deduplicate unusable entries');
+check($normalized[0]['id'] === 'deepseek-flash', 'catalog id lost');
+check($normalized[0]['name'] === 'DeepSeek-V4.1-Flash', 'catalog display name lost');
+check($normalized[0]['context_window'] === 1048576, 'catalog context window lost');
+check($normalized[0]['max_output_tokens'] === 393216, 'catalog output cap lost');
+check($normalized[0]['effort_levels'] === ['low', 'high', 'max'], 'effort levels not normalized and sorted');
+check($normalized[0]['default_effort'] === 'high', 'catalog default effort lost');
+
+$anthropicModels = ModelCatalog::normalize(['data' => [[
+    'id' => 'claude-opus-5-5',
+    'display_name' => 'Claude Opus 5.5',
+    'max_input_tokens' => 1000000,
+    'max_tokens' => 128000,
+]]]);
+check($anthropicModels[0]['name'] === 'Claude Opus 5.5', 'display_name was not mapped');
+check($anthropicModels[0]['context_window'] === 1000000, 'max_input_tokens was not mapped');
+check($anthropicModels[0]['max_output_tokens'] === 128000, 'max_tokens was not mapped');
+check($anthropicModels[0]['effort_levels'] === [], 'an effort capability was invented');
+
+$staticCatalogModels = ModelCatalog::normalizeStatic([
+    'deepseek-flash',
+    ['id' => 'deepseek-v4-pro', 'name' => 'DeepSeek-V4-Pro', 'effort_levels' => ['low', 'max'], 'default_effort' => 'max'],
+    ['id' => ''],
+    ['id' => 'deepseek-flash'],
+]);
+check(count($staticCatalogModels) === 2, 'static catalog did not deduplicate');
+check($staticCatalogModels[0]['name'] === 'deepseek-flash', 'static string entry lost its name');
+check($staticCatalogModels[1]['effort_levels'] === ['low', 'max'], 'static effort levels lost');
+check($staticCatalogModels[1]['default_effort'] === 'max', 'static default effort lost');
+
+check(ModelCatalog::clampEffort(null, ['low', 'high', 'max']) === [null, false], 'null effort was altered');
+check(ModelCatalog::clampEffort('high', ['low', 'high', 'max']) === ['high', false], 'declared effort was clamped');
+check(ModelCatalog::clampEffort('medium', ['low', 'high', 'max']) === ['high', true], 'medium did not clamp to high');
+check(ModelCatalog::clampEffort('xhigh', ['low', 'high', 'max']) === ['max', true], 'xhigh did not clamp to max');
+check(ModelCatalog::clampEffort('max', []) === ['max', false], 'undeclared levels clamped the effort');
+check(ModelCatalog::validEffort('MAX') && !ModelCatalog::validEffort('turbo'), 'effort validation is wrong');
+$invalidEffort = errorOf(static fn(): array => ModelCatalog::clampEffort('turbo', ['low']));
+check(str_contains($invalidEffort, 'Invalid effort level'), 'an invalid effort did not throw');
+$badModelsUrl = errorOf(static fn(): ModelCatalog => new ModelCatalog($root, 'ftp://example.test/models'));
+check(str_contains($badModelsUrl, 'http or https'), 'a non-http models_url was accepted');
+$badModelsAuth = errorOf(static fn(): ModelCatalog => new ModelCatalog($root, '', 'token'));
+check(str_contains($badModelsAuth, 'models_auth'), 'an invalid models_auth was accepted');
+
+$catalogRoot = $root . '/tests/.catalog-' . getmypid();
+@mkdir($catalogRoot . '/.agent', 0700, true);
+$catalogCacheFile = $catalogRoot . '/.agent/models-cache.json';
+try {
+    file_put_contents($catalogCacheFile, json_encode([
+        'version' => 1,
+        'url' => 'https://example.test/models',
+        'fetched_at' => time(),
+        'models' => $normalized,
+    ], JSON_THROW_ON_ERROR));
+    $cachedCatalog = new ModelCatalog($catalogRoot, 'https://example.test/models', 'none', '', 'x-api-key', '', '2023-06-01', 3600, []);
+    $cachedModels = $cachedCatalog->models();
+    check(count($cachedModels) === 2 && $cachedCatalog->source() === 'cache', 'fresh cache was not used');
+    check($cachedCatalog->effortLevels('deepseek-flash') === ['low', 'high', 'max'], 'cached effort levels are missing');
+    check($cachedCatalog->defaultEffort('deepseek-flash') === 'high', 'cached default effort is missing');
+    check($cachedCatalog->lastError() === null, 'cache use reported an error');
+
+    $staticFallback = new ModelCatalog($catalogRoot, '', 'bearer', '', 'x-api-key', '', '2023-06-01', 3600, $staticCatalogModels);
+    check($staticFallback->models() === $staticCatalogModels, 'static fallback was not used');
+    check($staticFallback->source() === 'static', 'static fallback source is wrong');
+    check($staticFallback->find('missing') === null, 'an unknown model was found');
+} finally {
+    @unlink($catalogCacheFile);
+    @rmdir($catalogRoot . '/.agent');
+    @rmdir($catalogRoot);
+}
+
+$bodyProbe = new class('unused') extends AnthropicClient {
+    /** @param array<int, array<string, mixed>> $messages @param array<int, array<string, mixed>> $tools */
+    public function body(string $model, int $maxTokens, string $system, array $messages, array $tools): array
+    {
+        return $this->requestBody($model, $maxTokens, $system, $messages, $tools);
+    }
+};
+$plainBody = $bodyProbe->body('probe-model', 10, 'sys', [['role' => 'user', 'content' => 'hi']], []);
+check(!isset($plainBody['output_config']), 'output_config was sent without an effort');
+check($plainBody['model'] === 'probe-model', 'the request body lost the model');
+$bodyProbe->setEffort('max');
+$effortBody = $bodyProbe->body('probe-model', 10, 'sys', [['role' => 'user', 'content' => 'hi']], []);
+check(($effortBody['output_config']['effort'] ?? null) === 'max', 'the effort is missing from the request body');
+$insideWithout = $bodyProbe->withoutEffort(fn(): array => $bodyProbe->body('probe-model', 10, 'sys', [], []));
+check(!isset($insideWithout['output_config']), 'withoutEffort did not omit the effort');
+check($bodyProbe->effort() === 'max', 'withoutEffort did not restore the effort');
+$invalidClientEffort = errorOf(static fn() => $bodyProbe->setEffort('turbo'));
+check(str_contains($invalidClientEffort, 'Invalid effort level'), 'the client accepted an invalid effort');
+
+$propProbe = new class('unused') extends AnthropicClient {
+    /** @var list<string> */
+    public array $models = [];
+    /** @var list<?string> */
+    public array $efforts = [];
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array
+    {
+        $this->models[] = $model;
+        $this->efforts[] = $this->effort();
+        return ['content' => [['type' => 'text', 'text' => 'ok']], 'stop_reason' => 'end_turn'];
+    }
+};
+$propAgent = new Agent($propProbe, $local, [], 'start-model', 100, 2);
+$propAgent->run('one');
+$propAgent->setModel('next-model');
+$propAgent->setEffort('max');
+$propAgent->run('two');
+check($propProbe->models === ['start-model', 'next-model'], 'a model switch did not reach the next call');
+check($propProbe->efforts === [null, 'max'], 'an effort switch did not reach the next call');
+check($propAgent->model() === 'next-model' && $propAgent->effort() === 'max', 'the agent did not expose the selection');
+$badModel = errorOf(static fn() => $propAgent->setModel("bad\nmodel"));
+check(str_contains($badModel, 'Invalid model name'), 'an invalid model name was accepted');
+$propAgent->setModel('deepseek/v4-pro');
+$propAgent->setModel('anthropic.claude-opus-5-5');
+check($propAgent->model() === 'anthropic.claude-opus-5-5', 'valid model name forms were rejected');
+
+$effortSession = 'smoke-effort-' . getmypid();
+$effortStore = new SessionStore($root, $effortSession);
+$effortSessionFile = $root . '/.agent/sessions/' . $effortSession . '.json';
+try {
+    $checkpointAgent = new Agent($propProbe, $local, [], 'start-model', 100, 2, $effortStore);
+    $checkpointAgent->setModel('deepseek-v4-pro');
+    $checkpointAgent->setEffort('low');
+    $checkpointAgent->run('save the selection');
+    $savedState = $effortStore->load();
+    check(($savedState['model'] ?? null) === 'deepseek-v4-pro', 'the checkpoint lost the model');
+    check(($savedState['effort'] ?? null) === 'low', 'the checkpoint lost the effort');
+} finally {
+    unset($effortStore);
+    @unlink($effortSessionFile);
+    @unlink($root . '/.agent/sessions/' . $effortSession . '.lock');
+}
+
+// The reviewer shares the actor's client but must never inherit its effort.
+$reviewProbe = new class($allowJson) extends AnthropicClient {
+    /** @var list<?string> */
+    public array $efforts = [];
+    public function __construct(private string $json)
+    {
+    }
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array
+    {
+        $this->efforts[] = $this->effort();
+        return ['content' => [['type' => 'text', 'text' => $this->json]], 'stop_reason' => 'end_turn'];
+    }
+};
+$reviewProbe->setEffort('max');
+$reviewGate = new SecurityClassifier($reviewProbe, 'reviewer', $root, ['audit_log' => '']);
+$reviewDecision = $reviewGate->review(
+    ['type' => 'tool_use', 'id' => 'effort-review', 'name' => 'write_file', 'input' => ['path' => 'tests/.effort-review.txt', 'content' => 'x']],
+    [],
+    $catalog
+);
+check($reviewDecision['verdict'] === 'allow', 'the reviewer did not allow the probe call');
+check($reviewProbe->efforts === [null], 'the reviewer inherited the actor effort');
+check($reviewProbe->effort() === 'max', 'the reviewer effort wrapper did not restore the effort');
 
 fwrite(STDOUT, "Smoke tests passed\n");

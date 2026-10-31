@@ -16,7 +16,75 @@ Composer manages autoloading and the test scripts. There are no third-party runt
 2. Set `"api_key"` in `config.json`, or leave it empty and set `ANTHROPIC_API_KEY` in your environment. A non-empty `api_key` wins; `api_key_env` names the fallback variable (default `ANTHROPIC_API_KEY`; set it to `""` to require the config key only).
 3. Run `php agent.php "Inspect this project and summarize it"` to open a session with that first task, or `php agent.php` for an empty interactive session. `composer` itself is only needed to install/refresh the autoloader; the agent runs directly with `php`. A finished answer never closes the session: type the next instruction at the `you>` prompt. In a terminal, only `Ctrl+C` ends the process; `/exit` and `/quit` do not exist.
 
-Use `--config=path`, `--model=MODEL`, `--max-steps=N`, or `--command-timeout=N` to override settings. `ANTHROPIC_MODEL` also overrides the config model. The default model is `claude-sonnet-5-5`; set a model your Anthropic account can access if needed. Each model request waits for a complete response before tools run.
+Use `--config=path`, `--model=MODEL`, `--effort=LEVEL`, `--max-steps=N`, or `--command-timeout=N` to override settings. The model defaults to `config.model`; see [Models and effort](#models-and-effort). Each model request waits for a complete response before tools run.
+
+## Models and effort
+
+The acting model defaults to `"model"` in `config.json`. Overrides, highest first:
+
+1. `--model=MODEL`
+2. the model saved in a resumed session (`--session=... --continue`)
+3. `config.model`
+4. `LLM_MODEL`
+5. `ANTHROPIC_MODEL`
+6. built-in `claude-sonnet-5-5`
+
+`config.model` outranks the environment on purpose: Claude Code exports
+`ANTHROPIC_MODEL`, and inheriting it would silently replace the configured provider
+model.
+
+In a session, `/model` prints the provider catalog as a numbered picker. Choose a
+number, type an id or a unique prefix, press Enter to keep the current model, `r` to
+refresh the catalog, or `q` to cancel. `/model <id>` switches directly. The catalog
+is fetched when you first ask for it (never at startup) from:
+
+- `models_url` when set;
+- otherwise `https://api.deepseek.com/models` for a DeepSeek `api_url`, or
+  `https://api.anthropic.com/v1/models` for an Anthropic one;
+- otherwise the static `models` list.
+
+The result is cached at `.agent/models-cache.json` for `models_cache_ttl` seconds
+(default `86400`; `0` always refetches). The cache contains model metadata only,
+never the API key. `--list-models` prints the catalog and exits; add
+`--refresh-models` to bypass the cache.
+
+`effort` sets the reasoning depth sent as `output_config.effort`:
+
+```json
+"effort": "high",
+"models_url": "https://api.deepseek.com/models",
+"models_auth": "bearer",
+"models_cache_ttl": 86400,
+"models": []
+```
+
+`effort` may be `low`, `medium`, `high`, `xhigh`, `max`, or `null` (omit the field
+and let the provider choose). `/effort` shows the levels the current model declares;
+`/effort <level>` switches; `/effort default` clears it. A level the model does not
+declare is clamped to the nearest supported level, with ties going higher (`medium`
+→ `high` on a model that supports only low/high/max). `--effort=LEVEL` overrides the
+config for one process.
+
+`models_auth` controls how the catalog GET authenticates: `bearer` (default,
+`Authorization: Bearer`), `header` (the configured `api_key_header`/prefix plus
+`anthropic-version`), or `none`.
+
+`models` is an optional static fallback used when the endpoint is unreachable. Each
+entry is an id string or an object:
+
+```json
+"models": [
+  "deepseek-flash",
+  { "id": "deepseek-v4-pro", "name": "DeepSeek-V4-Pro",
+    "effort_levels": ["low", "high", "max"], "default_effort": "high" }
+]
+```
+
+Switching models keeps the conversation. Prompt caches are model-scoped, so the turn
+after a switch is not a cache hit. The security reviewer keeps the model it started
+with and always runs at the provider-default effort, regardless of the actor's
+selection. Both selections are saved in the session checkpoint and restored by
+`--continue` unless a flag overrides them.
 
 ## Terminal UI
 
@@ -25,12 +93,13 @@ In an interactive terminal MyAgent renders a styled session:
 ```text
 ╭─ MyAgent ────────────────────────────────────────────────╮
 │ model      deepseek-flash                                │
+│ effort     high                                          │
 │ workspace  D:\Project\MyAgent                            │
 │ session    refactor                                      │
 │ security   reviewer deepseek-flash · fail-closed         │
 │ tools      5 local · 1 MCP server                        │
 ╰──────────────────────────────────────────────────────────╯
-  Type a task. /continue resumes unfinished work. Ctrl+C exits.
+  Type a task. /model and /effort change the run. /continue resumes. Ctrl+C exits.
 
 ❯ Summarize the architecture.
 ⏺ The project has three layers. …
@@ -187,7 +256,7 @@ The agent starts each process in the working directory, performs the MCP `2025-1
 
 ## Verify
 
-Run `composer test` (equivalently, `php tests/smoke.php`). The smoke test checks local skills and files, starts the bundled stdio MCP example, and exercises tool use, session recovery, compaction handling, the `ask_user` prompt with scripted input, and the security reviewer with fake Anthropic responses. It also runs `tests/ui.php`, which covers ANSI sanitizing, width/wrapping, Markdown rendering, tool summaries, plain-mode compatibility, and the styled/plain agent output paths. It does not make a paid API request.
+Run `composer test` (equivalently, `php tests/smoke.php`). The smoke test checks local skills and files, starts the bundled stdio MCP example, and exercises tool use, session recovery, compaction handling, the `ask_user` prompt with scripted input, and the security reviewer with fake Anthropic responses. It also runs `tests/ui.php`, which covers ANSI sanitizing, width/wrapping, Markdown rendering, tool summaries, plain-mode compatibility, and the styled/plain agent output paths, and `tests/selector.php`, which covers model/effort catalog normalization, clamping, request-body construction, reviewer effort isolation, and the scripted pickers. It does not make a paid API request.
 
 `php tests/render-demo.php --force --color=always --width=100` prints the visual gallery
 (banner, Markdown, tables, code, tool cards, security prompts, `ask_user`) for manual review.

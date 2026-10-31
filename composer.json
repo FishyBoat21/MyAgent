@@ -19,6 +19,7 @@
     "scripts": {
         "test": "@php tests/smoke.php",
         "test:ui": "@php tests/ui.php",
+        "test:selector": "@php tests/selector.php",
         "demo": "@php tests/render-demo.php --force --color=always --width=100"
     },
     "config": {

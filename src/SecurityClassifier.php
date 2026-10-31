@@ -190,13 +190,16 @@ final class SecurityClassifier
     /** Send the action to the dedicated reviewer model. */
     private function askReviewer(array $call, array $messages, array $catalog): array
     {
-        // Same provider/client as the actor, but compaction must not touch the policy prompt.
-        $response = $this->client->withoutCompaction(fn(): array => $this->client->message(
-            $this->model,
-            $this->maxTokens,
-            $this->systemPrompt(),
-            [['role' => 'user', 'content' => $this->userPrompt($call, $messages, $catalog)]],
-            []
+        // Same provider/client as the actor, but compaction must not touch the
+        // policy prompt and the reviewer must never inherit the actor's effort.
+        $response = $this->client->withoutCompaction(fn(): array => $this->client->withoutEffort(
+            fn(): array => $this->client->message(
+                $this->model,
+                $this->maxTokens,
+                $this->systemPrompt(),
+                [['role' => 'user', 'content' => $this->userPrompt($call, $messages, $catalog)]],
+                []
+            )
         ));
         $parts = [];
         foreach ((array) ($response['content'] ?? []) as $block) {

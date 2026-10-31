@@ -14,13 +14,15 @@ use MyAgent\AnthropicClient;
 use MyAgent\AskUser;
 use MyAgent\LocalTools;
 use MyAgent\McpClient;
+use MyAgent\ModelCatalog;
+use MyAgent\ModelSelector;
 use MyAgent\SecurityClassifier;
 use MyAgent\Skills;
 use MyAgent\SessionStore;
 use MyAgent\Terminal;
 
 $root = getcwd();
-$options = getopt('', ['config:', 'model:', 'max-steps:', 'command-timeout:', 'session:', 'continue', 'help', 'plain', 'no-color', 'width:', 'no-banner', 'tool-details:']);
+$options = getopt('', ['config:', 'model:', 'effort:', 'max-steps:', 'command-timeout:', 'session:', 'continue', 'help', 'plain', 'no-color', 'width:', 'no-banner', 'tool-details:', 'list-models', 'refresh-models']);
 $plain = isset($options['plain']);
 
 if (isset($options['help'])) {
@@ -29,7 +31,10 @@ if (isset($options['help'])) {
     $help->out("Usage: php agent.php [options] [prompt...]\n\n");
     $help->out("Options:\n");
     $help->out("  --config=FILE           Config file (default: config.json)\n");
-    $help->out("  --model=MODEL           Override the model\n");
+    $help->out("  --model=MODEL           Override the model (default: config.model)\n");
+    $help->out("  --effort=LEVEL          low|medium|high|xhigh|max; omit for provider default\n");
+    $help->out("  --list-models           Print the provider's model catalog and exit\n");
+    $help->out("  --refresh-models        Bypass the cached catalog with --list-models\n");
     $help->out("  --max-steps=N           Model calls per run (default: 100)\n");
     $help->out("  --command-timeout=N     run_command timeout in seconds (default: 300)\n");
     $help->out("  --session=NAME          Save/restore progress under .agent/sessions/\n");
@@ -41,7 +46,10 @@ if (isset($options['help'])) {
     $help->out("  --tool-details=MODE     summary|full|hidden (default: summary)\n");
     $help->out("  --help                  Show this help\n");
     $help->out("\nInteractive commands:\n");
+    $help->out("  /model [id|number]      Show or switch the model\n");
+    $help->out("  /effort [level]         Show or switch the reasoning effort\n");
     $help->out("  /continue               Give unfinished work another step budget\n");
+    $help->out("  /help                   Show this command list\n");
     $help->out("  Ctrl+C                  Exit the session\n");
     $help->out("\nSet \"api_key\" in the config file, or set the api_key_env environment variable\n");
     $help->out("(default ANTHROPIC_API_KEY). A dedicated security reviewer checks every tool call.\n");
@@ -72,7 +80,29 @@ try {
             throw new RuntimeException("Set \"api_key\" in the config or the $keyEnv environment variable");
         }
     }
-    $model = $options['model'] ?? (getenv('LLM_MODEL') ?: (getenv('ANTHROPIC_MODEL') ?: ($config['model'] ?? 'claude-sonnet-5-5')));
+    // config.model is the documented default. Environment variables are
+    // fallbacks only: Claude Code exports ANTHROPIC_MODEL, and inheriting it
+    // would silently override the configured provider model.
+    $configModel = trim((string) ($config['model'] ?? ''));
+    $envModel = trim((string) getenv('LLM_MODEL'));
+    $legacyEnvModel = trim((string) getenv('ANTHROPIC_MODEL'));
+    $model = isset($options['model']) ? (string) $options['model'] : (
+        $configModel !== '' ? $configModel : (
+            $envModel !== '' ? $envModel : ($legacyEnvModel !== '' ? $legacyEnvModel : 'claude-sonnet-5-5')
+        )
+    );
+    $configEffort = $config['effort'] ?? null;
+    if ($configEffort !== null && !is_string($configEffort)) {
+        throw new RuntimeException('effort must be a string or null');
+    }
+    $effort = isset($options['effort']) ? (string) $options['effort'] : $configEffort;
+    $effort = $effort === null ? null : strtolower(trim($effort));
+    if ($effort === '') {
+        $effort = null;
+    }
+    if ($effort !== null && !in_array($effort, AnthropicClient::EFFORT_LEVELS, true)) {
+        throw new RuntimeException('Invalid effort level: ' . $effort);
+    }
     $apiUrl = (string) (getenv('LLM_API_URL') ?: ($config['api_url'] ?? 'https://api.anthropic.com/v1/messages'));
     $apiKeyHeader = (string) ($config['api_key_header'] ?? 'x-api-key');
     $apiKeyPrefix = (string) ($config['api_key_prefix'] ?? '');
@@ -84,6 +114,36 @@ try {
         || str_contains($apiVersion, "\r") || str_contains($apiVersion, "\n")) {
         throw new RuntimeException('Invalid API URL or header configuration');
     }
+    // Provider catalog: an explicit models_url always wins. Otherwise a small
+    // known-provider map covers the two endpoints this agent targets; unknown
+    // hosts must configure models_url or rely on the static "models" list.
+    $catalogHost = strtolower((string) parse_url($apiUrl, PHP_URL_HOST));
+    $knownModelsUrl = match ($catalogHost) {
+        'api.deepseek.com' => 'https://api.deepseek.com/models',
+        'api.anthropic.com' => 'https://api.anthropic.com/v1/models',
+        default => '',
+    };
+    $knownModelsAuth = $catalogHost === 'api.anthropic.com' ? 'header' : 'bearer';
+    $configuredModelsUrl = trim((string) ($config['models_url'] ?? ''));
+    $modelsUrl = $configuredModelsUrl !== '' ? $configuredModelsUrl : $knownModelsUrl;
+    $configuredModelsAuth = trim((string) ($config['models_auth'] ?? ''));
+    $modelsAuth = $configuredModelsAuth !== '' ? $configuredModelsAuth : $knownModelsAuth;
+    $modelsCacheTtl = (int) ($config['models_cache_ttl'] ?? 86400);
+    $staticModels = $config['models'] ?? [];
+    if (!is_array($staticModels)) {
+        throw new RuntimeException('models must be an array');
+    }
+    $catalog = new ModelCatalog(
+        $root,
+        $modelsUrl,
+        $modelsAuth,
+        (string) $apiKey,
+        $apiKeyHeader,
+        $apiKeyPrefix,
+        $apiVersion,
+        $modelsCacheTtl,
+        $staticModels
+    );
     $maxSteps = (int) ($options['max-steps'] ?? $config['max_steps'] ?? 100);
     $maxTokens = (int) ($config['max_tokens'] ?? 4096);
     $commandTimeout = (int) ($options['command-timeout'] ?? $config['command_timeout'] ?? 300);
@@ -111,6 +171,56 @@ try {
         $uiOptions['tool_details'] = (string) $options['tool-details'];
     }
     $ui = Terminal::detect($uiOptions, $plain);
+    $defaultModelLabel = $model;
+
+    if (isset($options['list-models'])) {
+        $models = $catalog->models(isset($options['refresh-models']));
+        if ($catalog->lastError() !== null) {
+            $ui->warning('Model catalog: ' . $catalog->lastError()
+                . ($models === [] ? '' : ' (using the ' . $catalog->source() . ' list)'));
+        }
+        if ($models === []) {
+            $ui->error('No models available. Set models_url or a static "models" list.');
+            exit(1);
+        }
+        $formatTokens = static function (?int $tokens): string {
+            if ($tokens === null) {
+                return '';
+            }
+            $trim = static function (float $value): string {
+                $text = number_format($value, 1, '.', '');
+                return rtrim(rtrim($text, '0'), '.');
+            };
+            if ($tokens >= 1_000_000) {
+                return $trim($tokens / 1_000_000) . 'M';
+            }
+            if ($tokens >= 1000) {
+                return (string) (int) round($tokens / 1000) . 'K';
+            }
+            return (string) $tokens;
+        };
+        $ui->heading('Provider models (' . $catalog->source() . ')');
+        foreach ($models as $entry) {
+            $id = (string) ($entry['id'] ?? '');
+            $bits = [];
+            $context = $entry['context_window'] ?? null;
+            if (is_int($context)) {
+                $bits[] = $formatTokens($context) . ' ctx';
+            }
+            $output = $entry['max_output_tokens'] ?? null;
+            if (is_int($output)) {
+                $bits[] = $formatTokens($output) . ' out';
+            }
+            $levels = $entry['effort_levels'] ?? [];
+            if (is_array($levels) && $levels !== []) {
+                $bits[] = 'effort ' . implode('/', $levels);
+            }
+            $ui->out(($id === $model ? '* ' : '  ') . $id
+                . '  ' . (string) ($entry['name'] ?? $id)
+                . ($bits === [] ? '' : '  · ' . implode(' · ', $bits)) . "\n");
+        }
+        exit(0);
+    }
 
     $skills = new Skills($root);
     $isTty = @stream_isatty(STDIN);
@@ -138,8 +248,30 @@ try {
         return null;
     };
     $askUser = $isTty ? new AskUser($readLine, null, $ui) : new AskUser();
+    $selector = $isTty ? new ModelSelector($readLine, null, $ui) : new ModelSelector();
     $local = new LocalTools($root, $skills, $commandTimeout, $askUser);
     $store = isset($options['session']) ? new SessionStore($root, (string) $options['session']) : null;
+
+    // A resumed session restores the model/effort it was using, unless the
+    // command line overrides them. Explicit flags always win.
+    if (isset($options['continue']) && $store !== null) {
+        $sessionState = $store->load();
+        if ($sessionState !== null) {
+            $savedModel = $sessionState['model'] ?? null;
+            if (!isset($options['model']) && is_string($savedModel) && trim($savedModel) !== '') {
+                $model = $savedModel;
+            }
+            if (!isset($options['effort']) && array_key_exists('effort', $sessionState)) {
+                $savedEffort = $sessionState['effort'];
+                if ($savedEffort === null) {
+                    $effort = null;
+                } elseif (is_string($savedEffort)
+                    && in_array(strtolower(trim($savedEffort)), AnthropicClient::EFFORT_LEVELS, true)) {
+                    $effort = strtolower(trim($savedEffort));
+                }
+            }
+        }
+    }
 
     $mcp = [];
     $mcpStatuses = [];
@@ -162,6 +294,7 @@ try {
     }
 
     $api = new AnthropicClient((string) $apiKey, $apiUrl, $apiKeyHeader, $apiKeyPrefix, $apiVersion);
+    $api->setEffort($effort);
     $securityOptions = $config['security'] ?? [];
     if (!is_array($securityOptions)) {
         throw new RuntimeException('security must be an object');
@@ -190,6 +323,7 @@ try {
 
     $bannerShown = $ui->banner([
         'model' => (string) $model,
+        'effort' => $effort ?? 'provider default',
         'workspace' => $root,
         'session' => isset($options['session'])
             ? (string) $options['session'] . (isset($options['continue']) ? ' (resume)' : '')
@@ -225,6 +359,64 @@ try {
         $ui->warning('Work is unfinished (step limit). Type /continue for another step budget.');
     }
 
+    $loadModels = static function (bool $refresh) use ($catalog, $ui): array {
+        $models = $catalog->models($refresh);
+        if ($catalog->lastError() !== null) {
+            $ui->warning('Model catalog: ' . $catalog->lastError()
+                . ($models === [] ? '' : ' (using the ' . $catalog->source() . ' list)'));
+        }
+        return $models;
+    };
+    $printModels = static function (array $models, string $current) use ($ui): void {
+        $ui->info('Current model: ' . $current);
+        if ($models === []) {
+            $ui->warning('No provider models are available. Use /model <id> to set one directly.');
+            return;
+        }
+        foreach ($models as $index => $entry) {
+            $id = (string) ($entry['id'] ?? '');
+            $ui->info(($index + 1) . ') ' . $id . ($id === $current ? '  (current)' : ''));
+        }
+    };
+    $applyModel = static function (string $id) use ($agent, $catalog, $ui): void {
+        $previousEffort = $agent->effort();
+        $agent->setModel($id);
+        $levels = $catalog->effortLevels($id);
+        $defaultLevel = $catalog->defaultEffort($id);
+        if ($previousEffort !== null && $levels !== []) {
+            [$clamped, $wasClamped] = ModelCatalog::clampEffort($previousEffort, $levels, $defaultLevel);
+            if ($wasClamped) {
+                $agent->setEffort($clamped);
+                $ui->info('Effort "' . $previousEffort . '" is not supported by ' . $id
+                    . '; using "' . ($clamped ?? 'provider default') . '".');
+            }
+        }
+        $ui->info('Model set to ' . $id
+            . ($agent->effort() !== null ? ' · effort ' . $agent->effort() : ' · provider-default effort'));
+    };
+    $applyEffort = static function (string $requested) use ($agent, $catalog, $ui): void {
+        $lower = strtolower(trim($requested));
+        if (in_array($lower, ['default', 'none', 'off'], true)) {
+            $agent->setEffort(null);
+            $ui->info('Effort set to provider default.');
+            return;
+        }
+        if (!ModelCatalog::validEffort($lower)) {
+            $ui->warning('Unknown effort level "' . $requested . '". Use low, medium, high, xhigh, max, or default.');
+            return;
+        }
+        $levels = $catalog->effortLevels($agent->model());
+        $defaultLevel = $catalog->defaultEffort($agent->model());
+        [$effort, $clamped] = ModelCatalog::clampEffort($lower, $levels, $defaultLevel);
+        $agent->setEffort($effort);
+        if ($clamped) {
+            $ui->info('Effort "' . $lower . '" is not supported by ' . $agent->model()
+                . '; using "' . ($effort ?? 'provider default') . '".');
+        } else {
+            $ui->info('Effort set to ' . ($effort ?? 'provider default') . '.');
+        }
+    };
+
     // A finished model turn never closes the session: fall through to the
     // prompt and keep waiting for the user. In a terminal only Ctrl+C stops
     // the process; /exit and /quit no longer exist. Piped stdin still ends
@@ -249,7 +441,103 @@ try {
             continue;
         }
         $promptShown = false;
-        $complete = $input === '/continue' ? $agent->resume() : $agent->run($input);
+        $complete = true;
+        if ($input === '/continue') {
+            $complete = $agent->resume();
+        } elseif ($input === '/help') {
+            $ui->err($ui->styleErr('Commands', 'bold', 'accent') . "\n");
+            foreach ([
+                '/model [id|number]  Show or switch the model',
+                '/effort [level]     Show or switch the reasoning effort',
+                '/continue           Give unfinished work another step budget',
+                '/help               Show this command list',
+                'Ctrl+C              Exit the session',
+            ] as $commandLine) {
+                $ui->info($commandLine);
+            }
+        } elseif ($input === '/model' || str_starts_with($input, '/model ')) {
+            $arg = trim(substr($input, 6));
+            if (in_array(strtolower($arg), ['refresh', 'r'], true)) {
+                $printModels($loadModels(true), $agent->model());
+            } elseif ($arg === '') {
+                $models = $loadModels(false);
+                if ($selector->available()) {
+                    try {
+                        $choice = $selector->pickModel(
+                            $models,
+                            $agent->model(),
+                            $defaultModelLabel,
+                            static fn(bool $refresh): array => $loadModels($refresh)
+                        );
+                        if ($choice['action'] === 'select' && $choice['model'] !== null) {
+                            $applyModel($choice['model']);
+                        } else {
+                            $ui->info('Model unchanged (' . $agent->model() . ').');
+                        }
+                    } catch (RuntimeException $e) {
+                        $ui->warning($e->getMessage());
+                    }
+                } else {
+                    $printModels($models, $agent->model());
+                    $ui->info('Use /model <id> to switch.');
+                }
+            } else {
+                $resolution = ModelSelector::resolve($arg, $loadModels(false));
+                if ($resolution['status'] === 'match' && $resolution['model'] !== null) {
+                    try {
+                        $applyModel($resolution['model']);
+                    } catch (RuntimeException $e) {
+                        $ui->warning($e->getMessage());
+                    }
+                } elseif ($resolution['status'] === 'ambiguous') {
+                    $ui->warning('Ambiguous model prefix. Matches: ' . implode(', ', $resolution['candidates']));
+                } elseif ($resolution['status'] === 'invalid') {
+                    $ui->warning('Model number out of range. Use /model to see the list.');
+                } else {
+                    try {
+                        $applyModel($arg);
+                        $ui->warning('Note: "' . $arg . '" is not in the provider list; the next request may fail.');
+                    } catch (RuntimeException $e) {
+                        $ui->warning($e->getMessage());
+                    }
+                }
+            }
+        } elseif ($input === '/effort' || str_starts_with($input, '/effort ')) {
+            $arg = trim(substr($input, 8));
+            // Load declared levels (cache-first) so the list and clamping use
+            // the provider's real capabilities instead of the canonical five.
+            $loadModels(false);
+            if ($arg === '') {
+                $levels = $catalog->effortLevels($agent->model());
+                $defaultLevel = $catalog->defaultEffort($agent->model());
+                if ($selector->available()) {
+                    try {
+                        $choice = $selector->pickEffort($levels, $agent->effort(), $defaultLevel, $agent->model());
+                        if ($choice['action'] === 'select') {
+                            $agent->setEffort($choice['effort']);
+                            if ($choice['clamped']) {
+                                $ui->info('Effort "' . ($choice['requested'] ?? '') . '" is not supported by '
+                                    . $agent->model() . '; using "' . ($choice['effort'] ?? 'provider default') . '".');
+                            } else {
+                                $ui->info('Effort set to ' . ($choice['effort'] ?? 'provider default') . '.');
+                            }
+                        } else {
+                            $ui->info('Effort unchanged (' . ($agent->effort() ?? 'provider default') . ').');
+                        }
+                    } catch (RuntimeException $e) {
+                        $ui->warning($e->getMessage());
+                    }
+                } else {
+                    $ui->info('Current effort: ' . ($agent->effort() ?? 'provider default'));
+                    $ui->info('Available: ' . implode(', ', $levels === [] ? AnthropicClient::EFFORT_LEVELS : $levels));
+                    $ui->info('Use /effort <level> to switch.');
+                }
+            } else {
+                $applyEffort($arg);
+            }
+        } else {
+            $complete = $agent->run($input);
+        }
         if (!$complete) {
             $ui->warning('Work is unfinished (step limit). /continue gives it another step budget.');
         }

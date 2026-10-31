@@ -13,8 +13,13 @@ use Throwable;
  */
 class AnthropicClient
 {
+    /** Canonical effort levels, ordered from cheapest to most thorough. */
+    public const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
     private int $compactionThreshold = 0;
     private int $summaryMaxTokens = 2048;
+    /** null means "omit output_config and let the provider choose". */
+    private ?string $effort = null;
     /** @var null|Closure(): void */
     private ?Closure $progress = null;
 
@@ -87,11 +92,57 @@ class AnthropicClient
     }
 
     /**
+     * Set the reasoning effort sent as output_config.effort. null (or an
+     * empty string) omits the field entirely so the provider default applies.
+     *
+     * @throws RuntimeException for a level outside the canonical set.
+     */
+    public function setEffort(?string $effort): void
+    {
+        $effort = $effort === null ? null : strtolower(trim($effort));
+        if ($effort === '') {
+            $effort = null;
+        }
+        if ($effort !== null && !in_array($effort, self::EFFORT_LEVELS, true)) {
+            throw new RuntimeException('Invalid effort level: ' . $effort);
+        }
+        $this->effort = $effort;
+    }
+
+    public function effort(): ?string
+    {
+        return $this->effort;
+    }
+
+    /**
+     * Run a callback with effort omitted, then restore the previous setting.
+     * The security reviewer shares this client with the actor but must never
+     * inherit the actor's reasoning depth.
+     *
+     * @template T
+     * @param callable(): T $callback
+     * @return T
+     */
+    public function withoutEffort(callable $callback): mixed
+    {
+        $effort = $this->effort;
+        $this->effort = null;
+        try {
+            return $callback();
+        } finally {
+            $this->effort = $effort;
+        }
+    }
+
+    /**
+     * Build the request body for one Messages call. Kept separate from
+     * message() so the exact outgoing shape can be asserted in tests.
+     *
      * @param array<int, array<string, mixed>> $messages
      * @param array<int, array<string, mixed>> $tools
-     * @return array<string, mixed> Decoded assistant message.
+     * @return array<string, mixed>
      */
-    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array
+    protected function requestBody(string $model, int $maxTokens, string $system, array $messages, array $tools): array
     {
         $body = ['model' => $model, 'max_tokens' => $maxTokens, 'messages' => $messages];
         if ($system !== '') {
@@ -103,6 +154,20 @@ class AnthropicClient
             $tools[count($tools) - 1]['cache_control'] = ['type' => 'ephemeral'];
             $body['tools'] = $tools;
         }
+        if ($this->effort !== null) {
+            $body['output_config'] = ['effort' => $this->effort];
+        }
+        return $body;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $messages
+     * @param array<int, array<string, mixed>> $tools
+     * @return array<string, mixed> Decoded assistant message.
+     */
+    public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array
+    {
+        $body = $this->requestBody($model, $maxTokens, $system, $messages, $tools);
         $betas = [];
         $approxChars = strlen($system) + strlen((string) json_encode($messages, JSON_INVALID_UTF8_SUBSTITUTE));
         if ($this->compactionThreshold > 0 && $approxChars >= $this->compactionThreshold) {
@@ -827,6 +892,8 @@ final class Agent
     private array $messages = [];
     /** @var array<string, McpClient> alias => client */
     private array $mcpByAlias = [];
+    /** Mirrors AnthropicClient::effort() for checkpoints and the banner. */
+    private ?string $effort = null;
 
     /** @param McpClient[] $mcp */
     public function __construct(
@@ -846,6 +913,7 @@ final class Agent
             $this->terminal = Terminal::plain();
         }
         $api->setCompactionSettings($compactionThreshold, $summaryMaxTokens);
+        $this->effort = $api->effort();
         foreach ($mcp as $client) {
             foreach (array_keys($client->definitions()) as $alias) {
                 $this->mcpByAlias[$alias] = $client;
@@ -857,6 +925,39 @@ final class Agent
                 $this->messages = $state['messages'];
             }
         }
+    }
+
+    public function model(): string
+    {
+        return $this->model;
+    }
+
+    /**
+     * Switch the acting model. Takes effect on the next model call; the
+     * conversation history is deliberately left intact.
+     *
+     * @throws RuntimeException for an empty or malformed model name.
+     */
+    public function setModel(string $model): void
+    {
+        $model = trim($model);
+        if ($model === '' || strlen($model) > 200
+            || preg_match('/\A[A-Za-z0-9][A-Za-z0-9._:\/@+\[\]-]*\z/', $model) !== 1) {
+            throw new RuntimeException('Invalid model name');
+        }
+        $this->model = $model;
+    }
+
+    public function effort(): ?string
+    {
+        return $this->effort;
+    }
+
+    /** Set the acting effort; null omits output_config for the next request. */
+    public function setEffort(?string $effort): void
+    {
+        $this->api->setEffort($effort);
+        $this->effort = $this->api->effort();
     }
 
     public function run(string $prompt): bool
@@ -1139,6 +1240,7 @@ final class Agent
         $this->store->save([
             'version' => 1,
             'model' => $this->model,
+            'effort' => $this->effort,
             'in_progress' => $inProgress,
             'pending_results' => $pending,
             'messages' => $this->messages,
