@@ -220,6 +220,72 @@ $agent = new Agent($fake, $local, [], 'test', 100, 3);
 $agent->run('Read config');
 check($fake->calls === 2, 'Agent did not continue after tool use');
 
+// --- Tool result size limit --------------------------------------------------
+
+check($agent->toolResultLimit() === 100000, 'Unexpected default tool result limit');
+check(
+    errorOf(static function () use ($local): void {
+        (new Agent(new class('unused') extends AnthropicClient {}, $local, [], 'test', 100, 1))->setToolResultLimit(-1);
+    }) !== '',
+    'Negative tool result limit was accepted'
+);
+$bigFile = 'tests/.smoke-large-output.txt';
+$bigContent = str_repeat("line of tool output\n", 2000);
+file_put_contents($root . '/' . $bigFile, $bigContent);
+try {
+    $limited = new class('unused') extends AnthropicClient {
+        public ?string $toolResult = null;
+        public int $calls = 0;
+        public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+            $this->calls++;
+            if ($this->calls === 1) {
+                return ['content' => [['type' => 'tool_use', 'id' => 'big-1', 'name' => 'read_file', 'input' => ['path' => 'tests/.smoke-large-output.txt']]], 'stop_reason' => 'tool_use'];
+            }
+            $this->toolResult = (string) ($messages[2]['content'][0]['content'] ?? '');
+            return ['content' => [['type' => 'text', 'text' => 'done']], 'stop_reason' => 'end_turn'];
+        }
+    };
+    $limitAgent = new Agent($limited, $local, [], 'test', 100, 2);
+    $limitAgent->setToolResultLimit(1000);
+    $limitAgent->run('Read the big file');
+    $toolResult = (string) $limited->toolResult;
+    check(str_contains($toolResult, '[myagent] Tool output truncated'), 'Oversized tool output was not flagged');
+    check(str_starts_with($toolResult, substr($bigContent, 0, 1000)), 'Oversized tool output lost its prefix');
+    check(strlen($toolResult) < strlen($bigContent), 'Oversized tool output was not shortened');
+    check(preg_match('/Full output saved to: (.+)/', $toolResult, $match) === 1, 'Spill file path missing from the tool result');
+    $spillPath = trim($match[1]);
+    try {
+        check(is_file($spillPath), 'The full tool output was not written to a temp file');
+        check(file_get_contents($spillPath) === $bigContent, 'The spill file does not contain the full tool output');
+        $tempRoot = realpath(sys_get_temp_dir());
+        check(
+            $tempRoot !== false && str_starts_with(strtolower((string) realpath(dirname($spillPath))), strtolower($tempRoot)),
+            'The spill file is not in the system temp directory'
+        );
+    } finally {
+        @unlink($spillPath);
+    }
+
+    $unlimited = new class('unused') extends AnthropicClient {
+        public ?string $toolResult = null;
+        public int $calls = 0;
+        public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array {
+            $this->calls++;
+            if ($this->calls === 1) {
+                return ['content' => [['type' => 'tool_use', 'id' => 'big-2', 'name' => 'read_file', 'input' => ['path' => 'tests/.smoke-large-output.txt']]], 'stop_reason' => 'tool_use'];
+            }
+            $this->toolResult = (string) ($messages[2]['content'][0]['content'] ?? '');
+            return ['content' => [['type' => 'text', 'text' => 'done']], 'stop_reason' => 'end_turn'];
+        }
+    };
+    $unlimitedAgent = new Agent($unlimited, $local, [], 'test', 100, 2);
+    $unlimitedAgent->setToolResultLimit(0);
+    $unlimitedAgent->run('Read the big file');
+    check($unlimited->toolResult === $bigContent, 'A zero limit should leave tool output unchanged');
+} finally {
+    @unlink($root . '/' . $bigFile);
+}
+
 $sessionName = 'smoke-' . getmypid();
 $store = new SessionStore($root, $sessionName);
 $sessionFile = $root . '/.agent/sessions/' . $sessionName . '.json';

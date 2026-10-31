@@ -187,6 +187,10 @@ The Anthropic client retries temporary network, rate limit, and server errors tw
 
 `list_files`, `read_file`, `write_file`, `run_command`, and `read_skill` are available to the model. In an interactive terminal, `ask_user` is also available (see below). File tools stay inside the current working directory. `run_command` executes a shell command there, with a configurable timeout (300 seconds by default) and limited returned output. It can execute arbitrary commands with the user's OS permissions, so run the agent only in a project you trust. Every call also passes the security reviewer described below.
 
+### Tool output size
+
+By default a single tool result is capped at `100000` bytes (`max_tool_result_chars` in `config.json`, or `--tool-result-limit=N`; `0` disables the cap). Larger output is not dropped: the full text is written to a `.txt` file in the system temp directory (for example `%TEMP%` on Windows or `/tmp` elsewhere), and the tool result keeps the first part plus a notice with the file path and size. Read the rest with `run_command` (for example `Get-Content -TotalCount N` or `Select-Object -Skip N -First M` on Windows, `head`/`tail`/`sed -n` elsewhere); `read_file` cannot open paths outside the project. Temp files may contain sensitive tool output, so delete them when they are no longer needed.
+
 ## Asking the user
 
 In an interactive terminal the agent can call `ask_user` to ask one question with 1–4 plain-text options. The prompt is shown on STDERR as a numbered list plus an always-present `Other` line:

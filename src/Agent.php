@@ -894,6 +894,8 @@ final class Agent
     private array $mcpByAlias = [];
     /** Mirrors AnthropicClient::effort() for checkpoints and the banner. */
     private ?string $effort = null;
+    /** Maximum bytes kept from one tool result; larger output is spilled to a temp file. 0 disables the cap. */
+    private int $toolResultLimit = 100000;
 
     /** @param McpClient[] $mcp */
     public function __construct(
@@ -958,6 +960,21 @@ final class Agent
     {
         $this->api->setEffort($effort);
         $this->effort = $this->api->effort();
+    }
+
+    /** Bytes kept from one tool result; 0 means unlimited. */
+    public function toolResultLimit(): int
+    {
+        return $this->toolResultLimit;
+    }
+
+    /** Cap the text a single tool call may add to the conversation (0 = unlimited). */
+    public function setToolResultLimit(int $chars): void
+    {
+        if ($chars < 0) {
+            throw new RuntimeException('Tool result limit cannot be negative');
+        }
+        $this->toolResultLimit = $chars;
     }
 
     public function run(string $prompt): bool
@@ -1174,7 +1191,74 @@ final class Agent
             $block['content'] = 'Error: ' . get_class($e) . ': ' . $e->getMessage();
             $block['is_error'] = true;
         }
+        $block['content'] = $this->limitToolResult($name, (string) ($block['content'] ?? ''));
         return $block;
+    }
+
+    /**
+     * Keep one tool result within the configured size. Oversized output is
+     * written in full to a text file in the system temp directory; the
+     * conversation keeps a prefix and a pointer, so a single huge result
+     * cannot flood the context or the request body.
+     */
+    private function limitToolResult(string $tool, string $output): string
+    {
+        $limit = $this->toolResultLimit;
+        $length = strlen($output);
+        if ($limit === 0 || $length <= $limit) {
+            return $output;
+        }
+        $prefix = function_exists('mb_strcut')
+            ? mb_strcut($output, 0, $limit, 'UTF-8')
+            : substr($output, 0, $limit);
+        $shown = strlen($prefix);
+        $path = self::writeToolOutputFile($tool, $output);
+        if ($path === null) {
+            return $prefix . "\n\n[myagent] Tool output truncated: showing the first {$shown} of {$length} bytes. "
+                . 'The full output could not be saved to a temporary file.';
+        }
+        return $prefix . "\n\n[myagent] Tool output truncated: showing the first {$shown} of {$length} bytes. "
+            . "Full output saved to: {$path}\n"
+            . 'Read the rest with run_command (for example Get-Content -TotalCount N or Select-Object -Skip N -First M on Windows; '
+            . 'head, tail, or sed -n elsewhere). read_file cannot open paths outside the project.';
+    }
+
+    /** Write the full output to a new file in the system temp directory; null on failure. */
+    private static function writeToolOutputFile(string $tool, string $output): ?string
+    {
+        $directory = sys_get_temp_dir();
+        if ($directory === '' || !is_dir($directory)) {
+            return null;
+        }
+        $safe = substr((string) preg_replace('/[^A-Za-z0-9_-]+/', '-', $tool), 0, 40);
+        if ($safe === '' || $safe === '-') {
+            $safe = 'tool';
+        }
+        try {
+            $suffix = bin2hex(random_bytes(4));
+        } catch (Throwable) {
+            $suffix = str_replace('.', '', uniqid('', true));
+        }
+        for ($attempt = 0; $attempt < 5; $attempt++) {
+            $path = $directory . DIRECTORY_SEPARATOR
+                . 'myagent-' . $safe . '-' . date('Ymd-His') . '-' . $suffix . '.txt';
+            // Exclusive create: never overwrite a file another process owns.
+            $handle = @fopen($path, 'xb');
+            if ($handle === false) {
+                // Name collision (or an unwritable temp dir); try a fresh suffix.
+                $suffix = str_replace('.', '', uniqid('', true));
+                continue;
+            }
+            $written = fwrite($handle, $output);
+            fclose($handle);
+            if ($written !== strlen($output)) {
+                @unlink($path);
+                return null;
+            }
+            @chmod($path, 0600);
+            return $path;
+        }
+        return null;
     }
 
     /** @return array<string, array<string, mixed>> name => definition, for the security reviewer. */

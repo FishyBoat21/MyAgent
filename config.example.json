@@ -12,6 +12,7 @@
   "models_cache_ttl": 86400,
   "models": [],
   "max_tokens": 4096,
+  "max_tool_result_chars": 100000,
   "max_steps": 100,
   "command_timeout": 300,
   "compaction_threshold_chars": 24000,

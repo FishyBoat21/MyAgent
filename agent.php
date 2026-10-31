@@ -22,7 +22,7 @@ use MyAgent\SessionStore;
 use MyAgent\Terminal;
 
 $root = getcwd();
-$options = getopt('', ['config:', 'model:', 'effort:', 'max-steps:', 'command-timeout:', 'session:', 'continue', 'help', 'plain', 'no-color', 'width:', 'no-banner', 'tool-details:', 'list-models', 'refresh-models']);
+$options = getopt('', ['config:', 'model:', 'effort:', 'max-steps:', 'command-timeout:', 'tool-result-limit:', 'session:', 'continue', 'help', 'plain', 'no-color', 'width:', 'no-banner', 'tool-details:', 'list-models', 'refresh-models']);
 $plain = isset($options['plain']);
 
 if (isset($options['help'])) {
@@ -37,6 +37,7 @@ if (isset($options['help'])) {
     $help->out("  --refresh-models        Bypass the cached catalog with --list-models\n");
     $help->out("  --max-steps=N           Model calls per run (default: 100)\n");
     $help->out("  --command-timeout=N     run_command timeout in seconds (default: 300)\n");
+    $help->out("  --tool-result-limit=N   Max bytes per tool result; larger output goes to a temp file (default: 100000, 0 = unlimited)\n");
     $help->out("  --session=NAME          Save/restore progress under .agent/sessions/\n");
     $help->out("  --continue              Resume an unfinished named session\n");
     $help->out("  --plain                 Raw output for scripts and logs\n");
@@ -150,11 +151,13 @@ try {
     );
     $maxSteps = (int) ($options['max-steps'] ?? $config['max_steps'] ?? 100);
     $maxTokens = (int) ($config['max_tokens'] ?? 4096);
+    $toolResultLimit = (int) ($options['tool-result-limit'] ?? $config['max_tool_result_chars'] ?? 100000);
     $commandTimeout = (int) ($options['command-timeout'] ?? $config['command_timeout'] ?? 300);
     $compactionThreshold = (int) ($config['compaction_threshold_chars'] ?? $config['compaction_threshold'] ?? 24000);
     $summaryMaxTokens = (int) ($config['summary_max_tokens'] ?? 2048);
-    if ($maxSteps < 1 || $maxTokens < 1 || $commandTimeout < 1 || $compactionThreshold < 0 || $summaryMaxTokens < 1) {
-        throw new RuntimeException('Invalid step, token, command timeout, or compaction threshold setting');
+    if ($maxSteps < 1 || $maxTokens < 1 || $commandTimeout < 1 || $compactionThreshold < 0 || $summaryMaxTokens < 1
+        || $toolResultLimit < 0) {
+        throw new RuntimeException('Invalid step, token, command timeout, tool result limit, or compaction threshold setting');
     }
 
     $uiConfig = $config['ui'] ?? [];
@@ -324,6 +327,7 @@ try {
     }
 
     $agent = new Agent($api, $local, $mcp, (string) $model, $maxTokens, $maxSteps, $store, $compactionThreshold, $summaryMaxTokens, $security, $ui);
+    $agent->setToolResultLimit($toolResultLimit);
 
     $bannerShown = $ui->banner([
         'model' => (string) $model,
