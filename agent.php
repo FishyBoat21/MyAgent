@@ -15,6 +15,11 @@ use MyAgent\AskUser;
 use MyAgent\Bridge;
 use MyAgent\LocalTools;
 use MyAgent\McpClient;
+use MyAgent\MediaError;
+use MyAgent\MediaLimits;
+use MyAgent\MediaNormalizer;
+use MyAgent\MediaStore;
+use MyAgent\Mime;
 use MyAgent\ModelCatalog;
 use MyAgent\ModelSelector;
 use MyAgent\SecurityClassifier;
@@ -23,7 +28,7 @@ use MyAgent\SessionStore;
 use MyAgent\Terminal;
 
 $root = getcwd();
-$options = getopt('', ['config:', 'model:', 'effort:', 'user-id:', 'max-steps:', 'command-timeout:', 'tool-result-limit:', 'session:', 'continue', 'help', 'plain', 'no-color', 'width:', 'no-banner', 'tool-details:', 'list-models', 'refresh-models', 'bridge', 'bridge-max-event-bytes:']);
+$options = getopt('', ['config:', 'model:', 'effort:', 'user-id:', 'max-steps:', 'command-timeout:', 'tool-result-limit:', 'session:', 'continue', 'help', 'plain', 'no-color', 'width:', 'no-banner', 'tool-details:', 'list-models', 'refresh-models', 'bridge', 'bridge-max-event-bytes:', 'image:', 'no-media', 'media-max-edge:']);
 $plain = isset($options['plain']);
 // Machine mode: stdout becomes JSONL events, stdin a JSONL command channel.
 $bridge = isset($options['bridge'])
@@ -44,6 +49,9 @@ if (isset($options['help'])) {
     $help->out("  --max-steps=N           Model calls per run (default: 100)\n");
     $help->out("  --command-timeout=N     run_command timeout in seconds (default: 300)\n");
     $help->out("  --tool-result-limit=N   Max bytes per tool result; larger output goes to a temp file (default: 100000, 0 = unlimited)\n");
+    $help->out("  --image=FILE            Attach an image to the first task (repeatable)\n");
+    $help->out("  --no-media              Disable image input for this process\n");
+    $help->out("  --media-max-edge=N      Downscale images to this long edge (0 = never)\n");
     $help->out("  --session=NAME          Save/restore progress under .agent/sessions/\n");
     $help->out("  --continue              Resume an unfinished named session\n");
     $help->out("  --plain                 Raw output for scripts and logs\n");
@@ -58,6 +66,11 @@ if (isset($options['help'])) {
     $help->out("  /model [id|number]      Show or switch the model\n");
     $help->out("  /effort [level]         Show or switch the reasoning effort\n");
     $help->out("  /cache                  Show identity, cache breakpoints and hit rate\n");
+    $help->out("  /attach <path...>       Attach images to the next prompt\n");
+    $help->out("  /attachments            List the queued images\n");
+    $help->out("  /detach [n|all]         Drop a queued image, or all of them\n");
+    $help->out("  /paste                  Attach the clipboard image (Windows)\n");
+    $help->out("  /media                  Show image capability, limits and usage\n");
     $help->out("  /continue               Give unfinished work another step budget\n");
     $help->out("  /help                   Show this command list\n");
     $help->out("  Ctrl+C                  Exit the session\n");
@@ -264,6 +277,39 @@ try {
         exit(0);
     }
 
+    // ------------------------------------------------------------------ media
+    // Images arrive from --image, /attach, /paste, @mentions, the bridge, and the
+    // read_image tool. Every route shares one normalisation + store pipeline.
+    $flagValues = static function (array $argv, string $name): array {
+        $values = [];
+        $prefix = '--' . $name . '=';
+        foreach ($argv as $arg) {
+            if (is_string($arg) && str_starts_with($arg, $prefix)) {
+                $values[] = substr($arg, strlen($prefix));
+            }
+        }
+        return $values;
+    };
+    $mediaConfig = $config['media'] ?? [];
+    if (!is_array($mediaConfig)) {
+        throw new RuntimeException('media must be an object');
+    }
+    $mediaLimits = MediaLimits::fromConfig($mediaConfig);
+    if (isset($options['no-media'])) {
+        $mediaLimits = $mediaLimits->withImagesEnabled(false);
+    }
+    if (isset($options['media-max-edge'])) {
+        $mediaLimits = $mediaLimits->withMaxEdge((int) $options['media-max-edge']);
+    }
+    $imageArgs = $flagValues($argv, 'image');
+    $mediaStore = new MediaStore($root, $mediaLimits);
+    $mediaNormalizer = $mediaLimits->enabled ? new MediaNormalizer($mediaLimits, $mediaStore) : null;
+    if ($mediaLimits->enabled && $mediaLimits->retainHours > 0) {
+        // Referenced images are never pruned, so a live session always keeps its
+        // attachments even after the retention window.
+        $mediaStore->prune($mediaLimits->retainHours, MediaStore::referencedBy($root));
+    }
+
     $skills = new Skills($root);
     $isTty = $bridge === null ? @stream_isatty(STDIN) : false;
     $inputStream = STDIN;
@@ -300,7 +346,7 @@ try {
         $askUser = $isTty ? new AskUser($readLine, null, $ui) : new AskUser();
         $selector = $isTty ? new ModelSelector($readLine, null, $ui) : new ModelSelector();
     }
-    $local = new LocalTools($root, $skills, $commandTimeout, $askUser);
+    $local = new LocalTools($root, $skills, $commandTimeout, $askUser, $mediaNormalizer);
     $store = isset($options['session']) ? new SessionStore($root, (string) $options['session']) : null;
 
     // A resumed session restores the model/effort it was using, unless the
@@ -324,6 +370,112 @@ try {
         }
     }
 
+    // Capability: the model catalog's declaration (cache only, never a request),
+    // then the config fallback. Anything else means text only.
+    $declaredModalities = $catalog->cachedInputModalities((string) $model);
+    $effectiveModalities = $declaredModalities !== [] ? $declaredModalities : $mediaLimits->inputModalities;
+    $imagesEnabled = $mediaLimits->enabled && in_array('image', $effectiveModalities, true);
+    $agentModalities = $imagesEnabled ? ['text', 'image'] : ['text'];
+    if ($mediaLimits->enabled && !$imagesEnabled) {
+        $ui->info('media: ' . $model . ' does not declare image input; images are disabled for this run.');
+    }
+
+    /** Resolve a user-named path (flags, /attach, @mentions). Not sandboxed: the user chose it. */
+    $resolveUserPath = static function (string $path) use ($root): string {
+        $path = trim($path);
+        if ($path === '') {
+            throw new RuntimeException('media: empty path');
+        }
+        $isAbsolute = preg_match('#\A(?:[A-Za-z]:[\\\\/]|/|\\\\\\\\)#', $path) === 1;
+        $candidate = $isAbsolute ? $path : $root . DIRECTORY_SEPARATOR . $path;
+        $resolved = realpath($candidate);
+        if ($resolved === false) {
+            throw new RuntimeException('media: not found: ' . $path);
+        }
+        return $resolved;
+    };
+
+    /** @return array<string, mixed> MediaRef */
+    $attachImage = static function (string $path, string $source) use ($mediaNormalizer, $resolveUserPath): array {
+        if ($mediaNormalizer === null) {
+            throw new MediaError(MediaError::DISABLED, 'media: image support is disabled (media.enabled or --no-media)');
+        }
+        $display = basename(str_replace('\\', '/', trim($path)));
+        return $mediaNormalizer->fromFile($resolveUserPath($path), $display, $source);
+    };
+
+    $mediaStats = ['images' => 0, 'bytes' => 0, 'sha' => []];
+    $countMedia = static function (array $ref) use (&$mediaStats): void {
+        $sha = (string) ($ref['sha256'] ?? '');
+        if ($sha !== '' && isset($mediaStats['sha'][$sha])) {
+            return;
+        }
+        if ($sha !== '') {
+            $mediaStats['sha'][$sha] = true;
+        }
+        $mediaStats['images']++;
+        $mediaStats['bytes'] += (int) ($ref['bytes'] ?? 0);
+    };
+
+    /** @param list<array<string, mixed>> $refs @return array<int, array<string, mixed>> */
+    $promptBlocks = static function (string $text, array $refs) use ($mediaNormalizer, $mediaLimits): array {
+        $blocks = [];
+        $trimmed = trim($text);
+        if ($trimmed !== '') {
+            $blocks[] = ['type' => 'text', 'text' => $text];
+        } elseif ($refs !== []) {
+            $blocks[] = ['type' => 'text', 'text' => 'Describe the attached image(s).'];
+        }
+        $added = 0;
+        foreach ($refs as $ref) {
+            if ($added >= $mediaLimits->maxImagesPerMessage) {
+                $blocks[] = ['type' => 'text', 'text' => '[myagent] Further images omitted: media.max_images_per_message is '
+                    . $mediaLimits->maxImagesPerMessage . '.'];
+                break;
+            }
+            if ($mediaNormalizer === null) {
+                break;
+            }
+            $blocks[] = $mediaNormalizer->block($ref);
+            $added++;
+        }
+        return $blocks;
+    };
+
+    /**
+     * Attach images referenced as @path in a typed prompt.
+     *
+     * @return list<array<string, mixed>>
+     */
+    $refsFromMentions = static function (string $text) use ($mediaLimits, $attachImage, $ui): array {
+        if ($mediaLimits->mentions === 'off') {
+            return [];
+        }
+        if (preg_match_all('/(?<![\w@\/])@([^\s"\'`<>()\[\]]+)/u', $text, $matches) < 1) {
+            return [];
+        }
+        $refs = [];
+        $seen = [];
+        foreach (array_unique($matches[1]) as $token) {
+            // Sentence punctuation that follows a mention ("see @shot.png.") is
+            // prose, not part of the path; trim it before resolving the file.
+            $token = rtrim($token, '.,;:!?');
+            if ($token === '' || isset($seen[$token])) {
+                continue;
+            }
+            $seen[$token] = true;
+            if ($mediaLimits->mentions === 'images' && !Mime::looksLikeImage($token)) {
+                continue;
+            }
+            try {
+                $refs[] = $attachImage($token, 'user');
+            } catch (Throwable) {
+                // Not a usable file: leave the @token as literal text.
+            }
+        }
+        return $refs;
+    };
+
     $mcp = [];
     $mcpStatuses = [];
     $mcpNames = [];
@@ -334,7 +486,7 @@ try {
         if (!preg_match('/^[a-zA-Z0-9_-]+$/', (string) $name) || !is_array($server)) {
             throw new RuntimeException('Invalid MCP server configuration');
         }
-        $client = new McpClient((string) $name, $server, $root);
+        $client = new McpClient((string) $name, $server, $root, $mediaNormalizer);
         try {
             $client->connect();
             $mcp[] = $client;
@@ -382,8 +534,25 @@ try {
         $security = new SecurityClassifier($api, $reviewerModel, $root, $securityOptions, $approver);
     }
 
-    $agent = new Agent($api, $local, $mcp, (string) $model, $maxTokens, $maxSteps, $store, $compactionThreshold, $summaryMaxTokens, $security, $ui);
+    $agent = new Agent(
+        $api,
+        $local,
+        $mcp,
+        (string) $model,
+        $maxTokens,
+        $maxSteps,
+        $store,
+        $compactionThreshold,
+        $summaryMaxTokens,
+        $security,
+        $ui,
+        $mediaStore
+    );
     $agent->setToolResultLimit($toolResultLimit);
+    // Frozen for the process: the tool array is part of the cached prefix and the
+    // provider restricts mid-conversation tool mutations.
+    $agent->enableMediaTools($imagesEnabled);
+    $agent->setInputModalities($agentModalities);
 
     if ($bridge !== null) {
         $agent->setProgressHook($bridge->progressHook());
@@ -404,6 +573,13 @@ try {
             'mcp' => $mcpNames,
             'pid' => getmypid(),
             'ask_user' => $askUser->available(),
+            'media' => [
+                'enabled' => $imagesEnabled,
+                'images' => $imagesEnabled,
+                'max_bytes' => $mediaLimits->maxBytes,
+                'max_edge' => $mediaLimits->maxEdge,
+                'store' => $mediaLimits->store,
+            ],
         ]);
 
         $byeReason = 'idle-exit';
@@ -415,8 +591,65 @@ try {
                     $bridge->emit('warning', ['text' => 'empty prompt ignored']);
                     continue;
                 }
+                // Attachments travel as workspace paths; inline base64 would need a
+                // much larger line cap and would bypass the path checks.
+                $bridgeImages = [];
+                foreach ((array) ($command['attachments'] ?? []) as $attachmentIndex => $attachment) {
+                    if (!is_array($attachment)) {
+                        $bridge->emit('media_error', [
+                            'index' => $attachmentIndex,
+                            'path' => null,
+                            'reason' => 'invalid-attachment',
+                            'message' => 'attachments must be objects',
+                        ]);
+                        continue;
+                    }
+                    if (isset($attachment['data']) || isset($attachment['data_base64'])) {
+                        $bridge->emit('media_error', [
+                            'index' => $attachmentIndex,
+                            'path' => isset($attachment['path']) ? (string) $attachment['path'] : null,
+                            'reason' => 'inline-base64-unsupported',
+                            'message' => 'send a workspace path instead of inline bytes',
+                        ]);
+                        continue;
+                    }
+                    $attachmentPath = (string) ($attachment['path'] ?? '');
+                    if (!$imagesEnabled) {
+                        $bridge->emit('media_error', [
+                            'index' => $attachmentIndex,
+                            'path' => $attachmentPath,
+                            'reason' => 'disabled',
+                            'message' => 'images are disabled for this session',
+                        ]);
+                        continue;
+                    }
+                    try {
+                        $ref = $attachImage($attachmentPath, 'bridge');
+                        $bridgeImages[] = $ref;
+                        $countMedia($ref);
+                        $bridge->emit('attachment', [
+                            'index' => $attachmentIndex,
+                            'name' => (string) $ref['name'],
+                            'media_type' => (string) $ref['media_type'],
+                            'bytes' => (int) $ref['bytes'],
+                            'width' => $ref['width'],
+                            'height' => $ref['height'],
+                            'sha256' => (string) $ref['sha256'],
+                            'stored_path' => (string) $ref['path'],
+                        ]);
+                    } catch (Throwable $e) {
+                        $bridge->emit('media_error', [
+                            'index' => $attachmentIndex,
+                            'path' => $attachmentPath,
+                            'reason' => $e instanceof MediaError ? $e->reason : 'error',
+                            'message' => $e->getMessage(),
+                        ]);
+                    }
+                }
                 $bridge->emit('turn_start', ['prompt' => $text]);
-                $complete = $agent->run($text);
+                $complete = $bridgeImages === []
+                    ? $agent->run($text)
+                    : $agent->run($promptBlocks($text, $bridgeImages));
                 $bridge->emit('turn_end', ['complete' => $complete]);
                 if (!$complete) {
                     $bridge->emit('warning', ['text' => 'Step limit reached with work in progress. Send continue for another budget.']);
@@ -484,6 +717,11 @@ try {
             : 'off',
         'tools' => count($local->definitions()) . ' local',
         'mcp' => count($mcp) . ' server' . (count($mcp) === 1 ? '' : 's'),
+        'images' => !$mediaLimits->enabled
+            ? 'off'
+            : ($imagesEnabled
+                ? 'supported · ' . $mediaLimits->maxEdge . ' px · ' . Mime::formatBytes($mediaLimits->maxBytes)
+                : 'model has no image input'),
     ]);
     foreach ($mcpStatuses as $status) {
         if ($status[0] === 'ok') {
@@ -496,7 +734,86 @@ try {
         $ui->info("Security reviewer: {$reviewerModel}" . ($reviewerModel === $model ? ' (same model as actor)' : '') . ' on the main provider');
     }
 
+    /** Split "/attach a.png b c.png" arguments, honouring simple quoting. */
+    $splitPaths = static function (string $argument): array {
+        $tokens = [];
+        if (preg_match_all('/"([^"]+)"|\'([^\']+)\'|(\S+)/', $argument, $matches, PREG_SET_ORDER) > 0) {
+            foreach ($matches as $match) {
+                $value = (string) ($match[1] !== '' ? $match[1] : ($match[2] !== '' ? $match[2] : ($match[3] ?? '')));
+                if ($value !== '') {
+                    $tokens[] = $value;
+                }
+            }
+        }
+        return $tokens;
+    };
+
+    /** Grab the Windows clipboard image into the store; returns the saved path. */
+    $pasteImage = static function () use ($mediaStore, $mediaLimits): string {
+        if (!$mediaLimits->enabled) {
+            throw new RuntimeException('media: image support is disabled (media.enabled or --no-media)');
+        }
+        if (PHP_OS_FAMILY !== 'Windows') {
+            throw new RuntimeException('media: /paste is only available on Windows');
+        }
+        $inbox = $mediaStore->directory() . '/inbox';
+        if (!is_dir($inbox) && !@mkdir($inbox, 0700, true) && !is_dir($inbox)) {
+            throw new RuntimeException('media: could not create ' . $inbox);
+        }
+        $target = $inbox . '/clipboard-' . date('Ymd-His') . '-' . bin2hex(random_bytes(3)) . '.png';
+        $script = 'Add-Type -AssemblyName System.Windows.Forms;'
+            . '$img=[System.Windows.Forms.Clipboard]::GetImage();'
+            . 'if ($img -eq $null) { "no-image" } else { $img.Save(\''
+            . str_replace("'", "''", $target) . '\',[System.Drawing.Imaging.ImageFormat]::Png); "ok" }';
+        $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $process = @proc_open(
+            ['powershell', '-NoProfile', '-NonInteractive', '-STA', '-Command', $script],
+            $descriptors,
+            $pipes
+        );
+        if (!is_resource($process)) {
+            throw new RuntimeException('media: could not start PowerShell for the clipboard');
+        }
+        fclose($pipes[0]);
+        $errorOutput = trim((string) stream_get_contents($pipes[2]));
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($process);
+        if (!is_file($target)) {
+            throw new RuntimeException('media: no image on the clipboard'
+                . ($errorOutput === '' ? '' : ' (' . $errorOutput . ')'));
+        }
+        return $target;
+    };
+
+    /** True when the model that will see the next request accepts images. */
+    $mediaSupportedNow = static function () use ($agent): bool {
+        $modalities = $agent->inputModalities();
+        return $modalities === null || in_array('image', $modalities, true);
+    };
+
     $prompt = implode(' ', array_values(array_filter(array_slice($argv, 1), static fn($arg) => !str_starts_with($arg, '--'))));
+
+    // --image values are resolved once, in argument order, before the first turn.
+    $pendingImages = [];
+    foreach ($imageArgs as $imageArg) {
+        if (!$imagesEnabled) {
+            $ui->warning('media: images are disabled for this run; ignoring --image=' . $imageArg);
+            continue;
+        }
+        try {
+            $ref = $attachImage($imageArg, 'user');
+            $pendingImages[] = $ref;
+            $countMedia($ref);
+            $ui->info('+ ' . $ref['name'] . ' — ' . trim(Mime::describe($ref), '[]'));
+        } catch (Throwable $e) {
+            $ui->warning($e->getMessage());
+        }
+    }
+    if ($imageArgs !== [] && $pendingImages === [] && $prompt === '') {
+        throw new RuntimeException('no usable image and no prompt');
+    }
+
     $complete = true;
     if (isset($options['continue'])) {
         if ($store === null || $prompt !== '') {
@@ -504,7 +821,20 @@ try {
         }
         $complete = $agent->resume();
     } elseif ($prompt !== '') {
-        $complete = $agent->run($prompt);
+        $refs = array_merge($pendingImages, $refsFromMentions($prompt));
+        $pendingImages = [];
+        if ($refs === []) {
+            $complete = $agent->run($prompt);
+        } else {
+            foreach ($refs as $ref) {
+                $countMedia($ref);
+            }
+            if (!$mediaSupportedNow()) {
+                $ui->warning('media: ' . $agent->model()
+                    . ' does not accept images; the attachment(s) are sent as placeholders.');
+            }
+            $complete = $agent->run($promptBlocks($prompt, $refs));
+        }
     }
     if (!$complete) {
         $ui->warning('Work is unfinished (step limit). Type /continue for another step budget.');
@@ -529,9 +859,17 @@ try {
             $ui->info(($index + 1) . ') ' . $id . ($id === $current ? '  (current)' : ''));
         }
     };
-    $applyModel = static function (string $id) use ($agent, $catalog, $ui): void {
+    $applyModel = static function (string $id) use ($agent, $catalog, $ui, $mediaLimits): void {
         $previousEffort = $agent->effort();
         $agent->setModel($id);
+        // The tool set stays frozen; only the body gate follows the model.
+        $declared = $catalog->cachedInputModalities($id);
+        $effective = $declared !== [] ? $declared : $mediaLimits->inputModalities;
+        $supported = $mediaLimits->enabled && in_array('image', $effective, true);
+        $agent->setInputModalities($supported ? ['text', 'image'] : ['text']);
+        if ($mediaLimits->enabled && !$supported) {
+            $ui->info('media: ' . $id . ' does not accept images; existing images are sent as placeholders.');
+        }
         $levels = $catalog->effortLevels($id);
         $defaultLevel = $catalog->defaultEffort($id);
         if ($previousEffort !== null && $levels !== []) {
@@ -600,6 +938,11 @@ try {
             foreach ([
                 '/model [id|number]  Show or switch the model',
                 '/effort [level]     Show or switch the reasoning effort',
+                '/attach <path...>   Attach images to the next prompt',
+                '/attachments        List the queued images',
+                '/detach [n|all]     Drop one queued image, or all of them',
+                '/paste              Attach the clipboard image (Windows)',
+                '/media              Show image capability, limits and usage',
                 '/cache              Show identity, breakpoints and cache hit rate',
                 '/continue           Give unfinished work another step budget',
                 '/help               Show this command list',
@@ -622,6 +965,85 @@ try {
                 'cache_creation' => $cacheTotals['cache_creation'],
                 'hit_ratio' => $agent->cacheHitRatio(),
             ]);
+        } elseif (preg_match('#^/(attach|attachments|detach|paste|media)(?:\s+(.*))?$#', $input, $mediaCommand) === 1) {
+            $verb = (string) $mediaCommand[1];
+            $argument = trim((string) ($mediaCommand[2] ?? ''));
+            if ($verb === 'attach') {
+                if (!$mediaLimits->enabled) {
+                    $ui->warning('media: image support is disabled (media.enabled or --no-media).');
+                } elseif ($argument === '') {
+                    $ui->info('Usage: /attach <path> [path...]');
+                } else {
+                    foreach ($splitPaths($argument) as $attachPath) {
+                        try {
+                            $ref = $attachImage($attachPath, 'user');
+                            $pendingImages[] = $ref;
+                            $countMedia($ref);
+                            $ui->info('+ ' . $ref['name'] . ' — ' . trim(Mime::describe($ref), '[]'));
+                        } catch (Throwable $e) {
+                            $ui->warning($e->getMessage());
+                        }
+                    }
+                    if ($pendingImages !== [] && !$mediaSupportedNow()) {
+                        $ui->warning('media: ' . $agent->model()
+                            . ' does not accept images; they would be sent as placeholders.');
+                    }
+                }
+            } elseif ($verb === 'attachments') {
+                if ($pendingImages === []) {
+                    $ui->info('No queued images.');
+                } else {
+                    $total = 0;
+                    foreach ($pendingImages as $index => $ref) {
+                        $total += (int) $ref['bytes'];
+                        $ui->info(($index + 1) . ') ' . $ref['name'] . ' — ' . trim(Mime::describe($ref), '[]'));
+                    }
+                    $ui->info('Total: ' . count($pendingImages) . ' image(s), ' . Mime::formatBytes($total)
+                        . '. They are sent to the model provider with the next prompt.');
+                }
+            } elseif ($verb === 'detach') {
+                if ($argument === '' || strtolower($argument) === 'all') {
+                    $removed = count($pendingImages);
+                    $pendingImages = [];
+                    $ui->info('Detached ' . $removed . ' image(s).');
+                } elseif (ctype_digit($argument)) {
+                    $position = (int) $argument - 1;
+                    if (isset($pendingImages[$position])) {
+                        $removed = $pendingImages[$position];
+                        array_splice($pendingImages, $position, 1);
+                        $pendingImages = array_values($pendingImages);
+                        $ui->info('Detached ' . $removed['name'] . '.');
+                    } else {
+                        $ui->warning('No queued image at position ' . $argument . '.');
+                    }
+                } else {
+                    $ui->info('Usage: /detach <n|all>');
+                }
+            } elseif ($verb === 'paste') {
+                try {
+                    $ref = $attachImage($pasteImage(), 'user');
+                    $pendingImages[] = $ref;
+                    $countMedia($ref);
+                    $ui->info('+ ' . $ref['name'] . ' — ' . trim(Mime::describe($ref), '[]'));
+                } catch (Throwable $e) {
+                    $ui->warning($e->getMessage());
+                }
+            } else {
+                $ui->info('images      ' . ($mediaLimits->enabled
+                    ? ($mediaSupportedNow() ? 'supported' : 'not supported by ' . $agent->model())
+                    : 'off'));
+                $ui->info('limits      ' . $mediaLimits->maxEdge . ' px · ' . Mime::formatBytes($mediaLimits->maxBytes)
+                    . ' · ' . $mediaLimits->maxImagesPerMessage . ' per message · store ' . $mediaLimits->store);
+                $ui->info('pending     ' . ($pendingImages === []
+                    ? 'no attachments'
+                    : count($pendingImages) . ' image(s): ' . implode(', ', array_map(
+                        static fn(array $ref): string => (string) $ref['name'],
+                        $pendingImages
+                    ))));
+                $ui->info('used        ' . $mediaStats['images'] . ' image(s) · '
+                    . Mime::formatBytes($mediaStats['bytes']) . ' normalised · '
+                    . count($mediaStats['sha']) . ' unique');
+            }
         } elseif ($input === '/model' || str_starts_with($input, '/model ')) {
             $arg = trim(substr($input, 6));
             if (in_array(strtolower($arg), ['refresh', 'r'], true)) {
@@ -703,7 +1125,20 @@ try {
                 $applyEffort($arg);
             }
         } else {
-            $complete = $agent->run($input);
+            $refs = array_merge($pendingImages, $refsFromMentions($input));
+            if ($refs === []) {
+                $complete = $agent->run($input);
+            } else {
+                foreach ($refs as $ref) {
+                    $countMedia($ref);
+                }
+                if (!$mediaSupportedNow()) {
+                    $ui->warning('media: ' . $agent->model()
+                        . ' does not accept images; the attachment(s) are sent as placeholders.');
+                }
+                $complete = $agent->run($promptBlocks($input, $refs));
+                $pendingImages = [];
+            }
         }
         if (!$complete) {
             $ui->warning('Work is unfinished (step limit). /continue gives it another step budget.');

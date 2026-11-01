@@ -3,3 +3,7 @@ config.json
 .agent/
 vendor/
 skills/
+
+# Test scratch: per-run workspaces and the GD-generated image fixture.
+tests/.media-*
+tests/.bridge-media-*

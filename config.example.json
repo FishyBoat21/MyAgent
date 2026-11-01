@@ -16,6 +16,21 @@
     "conversation_breakpoint": true,
     "ttl": "5m"
   },
+  "media": {
+    "enabled": true,
+    "input_modalities": ["text", "image"],
+    "max_bytes": 5242880,
+    "max_edge": 1568,
+    "max_dimension": 8000,
+    "max_pixels": 40000000,
+    "max_images_per_message": 20,
+    "max_images_per_request": 20,
+    "max_images_per_tool_result": 4,
+    "store": ".agent/media",
+    "retain_hours": 168,
+    "mentions": "images",
+    "resize": true
+  },
   "models_url": "",
   "models_auth": "bearer",
   "models_cache_ttl": 86400,
@@ -33,7 +48,7 @@
     "context_messages": 12,
     "fail_closed": true,
     "review_all": false,
-    "auto_allow": ["list_files", "read_file", "read_skill", "ask_user"],
+    "auto_allow": ["list_files", "read_file", "read_skill", "ask_user", "read_image"],
     "audit_log": ".agent/security-audit.jsonl"
   },
   "ui": {

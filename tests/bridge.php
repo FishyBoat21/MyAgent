@@ -19,6 +19,10 @@ use MyAgent\AnthropicClient;
 use MyAgent\AskUser;
 use MyAgent\Bridge;
 use MyAgent\LocalTools;
+use MyAgent\MediaLimits;
+use MyAgent\MediaNormalizer;
+use MyAgent\MediaStore;
+use MyAgent\Mime;
 use MyAgent\Skills;
 use MyAgent\Terminal;
 
@@ -310,6 +314,94 @@ try {
     check(in_array('assistant', $types, true), 'the bridge turn emitted no assistant event');
     check(in_array('tool_start', $types, true) && in_array('tool_result', $types, true), 'the bridge turn emitted no tool events');
     check(in_array('usage', $types, true), 'the bridge turn emitted no usage event');
+
+    // --- B16: media descriptors travel, bytes never do ---------------------
+    $events = [];
+    $ui = Terminal::bridge(static function (string $type, array $payload) use (&$events): void {
+        $events[] = ['type' => $type] + $payload;
+    });
+    $ui->toolStart('read_image', ['path' => 'shot.png']);
+    $ui->toolResult('read_image', ['path' => 'shot.png'], '[image png 4×4 240 B sha 9f2c1a3b]', false, 0.05, [[
+        'name' => 'shot.png',
+        'media_type' => 'image/png',
+        'bytes' => 240,
+        'width' => 4,
+        'height' => 4,
+        'sha256' => str_repeat('9f', 32),
+        'descriptor' => '[image png 4×4 240 B sha 9f2c1a3b]',
+    ]]);
+    $result = ev($events, 1);
+    check($result['type'] === 'tool_result', 'B16 the media tool result event is missing');
+    check(isset($result['media']) && count($result['media']) === 1, 'B16 the media descriptor was not emitted');
+    check($result['media'][0]['sha256'] === str_repeat('9f', 32), 'B16 the media sha was lost');
+    check(!str_contains((string) json_encode($result), 'base64'), 'B16 base64 leaked into the bridge event');
+
+    // --- B17: an agent turn that returns an image --------------------------
+    $workspace = $root . '/tests/.bridge-media-' . getmypid();
+    // Remove the throwaway workspace even when an assertion fails below.
+    register_shutdown_function(static function () use ($workspace): void {
+        if (!is_dir($workspace)) {
+            return;
+        }
+        $items = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($workspace, FilesystemIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::CHILD_FIRST
+        );
+        foreach ($items as $item) {
+            $item->isDir() ? @rmdir($item->getPathname()) : @unlink($item->getPathname());
+        }
+        @rmdir($workspace);
+    });
+    @mkdir($workspace . '/docs', 0777, true);
+    $pngBytes = (static function (): string {
+        $image = imagecreatetruecolor(5, 5);
+        imagefill($image, 0, 0, imagecolorallocate($image, 30, 90, 150));
+        ob_start();
+        imagepng($image);
+        $bytes = (string) ob_get_clean();
+        imagedestroy($image);
+        return $bytes;
+    })();
+    file_put_contents($workspace . '/docs/shot.png', $pngBytes);
+    $bridgeLimits = new MediaLimits(store: '.agent/media');
+    $bridgeStore = new MediaStore($workspace, $bridgeLimits);
+    $bridgeNormalizer = new MediaNormalizer($bridgeLimits, $bridgeStore);
+    $bridgeTools = new LocalTools($workspace, new Skills($workspace), 300, null, $bridgeNormalizer);
+
+    $events = [];
+    $bridgeUi = Terminal::bridge(static function (string $type, array $payload) use (&$events): void {
+        $events[] = ['type' => $type] + $payload;
+    });
+    $imageProbe = new class('unused') extends AnthropicClient {
+        public int $calls = 0;
+        public function message(string $model, int $maxTokens, string $system, array $messages, array $tools): array
+        {
+            $this->calls++;
+            if ($this->calls === 1) {
+                return ['content' => [[
+                    'type' => 'tool_use',
+                    'id' => 'img-call',
+                    'name' => 'read_image',
+                    'input' => ['path' => 'docs/shot.png'],
+                ]], 'stop_reason' => 'tool_use'];
+            }
+            return ['content' => [['type' => 'text', 'text' => 'seen']], 'stop_reason' => 'end_turn'];
+        }
+    };
+    $imageAgent = new Agent($imageProbe, $bridgeTools, [], 'test-model', 100, 3, null, 24000, 2048, null, $bridgeUi, $bridgeStore);
+    $imageAgent->setInputModalities(['text', 'image']);
+    check($imageAgent->run('look') === true, 'B17 the image turn did not complete');
+
+    $toolResults = array_values(array_filter($events, static fn(array $event): bool => $event['type'] === 'tool_result'));
+    check(count($toolResults) === 1, 'B17 the image tool result was not emitted');
+    check(isset($toolResults[0]['media']) && count($toolResults[0]['media']) === 1, 'B17 the image descriptor is missing');
+    check(($toolResults[0]['media'][0]['media_type'] ?? '') === 'image/png', 'B17 the media type is wrong');
+    check(!str_contains((string) json_encode($toolResults[0]), 'base64'), 'B17 base64 leaked into the tool_result event');
+    check(
+        !str_contains((string) json_encode($events), (string) base64_encode($pngBytes)),
+        'B17 the raw image bytes reached the bridge'
+    );
+
 
     fwrite(STDOUT, "Bridge tests passed\n");
 } catch (Throwable $e) {
