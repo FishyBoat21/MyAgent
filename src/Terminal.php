@@ -875,6 +875,12 @@ final class Terminal
         return false;
     }
 
+    /** True when at least one of our own streams is a real terminal. */
+    private static function hasConsole(): bool
+    {
+        return @stream_isatty(STDIN) || @stream_isatty(STDOUT);
+    }
+
     private static function resolveWidth(array $options): int
     {
         $forced = (int) ($options['width'] ?? 0);
@@ -885,8 +891,18 @@ final class Terminal
         if ($columns !== false && is_numeric($columns) && (int) $columns >= 40) {
             return min(200, (int) $columns);
         }
+        if (!self::hasConsole()) {
+            // Nothing to measure: stdin and stdout are both redirected (a supervisor,
+            // CI, or `--bridge < commands.jsonl`). Probing would spawn a child process
+            // for a width nobody can see.
+            return 100;
+        }
         if (PHP_OS_FAMILY === 'Windows') {
-            $output = @shell_exec('mode con 2>NUL');
+            // The child must never inherit our stdin: with a redirected file the
+            // shared file position would advance past the first command and the
+            // parent's next read would look like EOF. See
+            // docs/plans/IMPLEMENTATION_PLAN-bridge-file-stdin.md §1.2.
+            $output = @shell_exec('mode con 2>NUL < NUL');
             if (is_string($output) && preg_match('/Columns:\s*(\d+)/i', $output, $match) === 1) {
                 return max(40, min(200, (int) $match[1]));
             }

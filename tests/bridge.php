@@ -403,6 +403,98 @@ try {
     );
 
 
+    // --- B18: a file-backed command channel still delivers --------------------
+    $commandFile = tempnam(sys_get_temp_dir(), 'myagent-b18-');
+    check(is_string($commandFile), 'B18 could not create the temp command file');
+    file_put_contents($commandFile, json_encode(['v' => 1, 'type' => 'prompt', 'text' => 'from a file']) . "\n");
+    $fileIn = fopen($commandFile, 'r');
+    $fileOut = fopen('php://memory', 'w+');
+    check(is_resource($fileIn) && is_resource($fileOut), 'B18 could not open the file channel');
+    $fileBridge = new Bridge(32768, 262144, 5, 5, $fileIn, $fileOut);
+    $fileCommand = $fileBridge->nextCommand();
+    check(($fileCommand['type'] ?? '') === 'prompt', 'B18 a file-backed channel lost its command');
+    check($fileBridge->commandsDelivered() === 1, 'B18 the delivered command was not counted');
+    check($fileBridge->danglingInputWarning() === null, 'B18 a delivered command still warned');
+    fclose($fileIn);
+    fclose($fileOut);
+    @unlink($commandFile);
+
+    // --- B19: one empty read is not end-of-channel ---------------------------
+    require_once __DIR__ . '/fixtures/flaky-stream.php';
+    stream_wrapper_register('flakystream', FlakyStream::class);
+    FlakyStream::$payload = json_encode(['v' => 1, 'type' => 'prompt', 'text' => 'after a dead read']) . "\n";
+    $flakyIn = fopen('flakystream://channel', 'r');
+    $flakyOut = fopen('php://memory', 'w+');
+    check(is_resource($flakyIn) && is_resource($flakyOut), 'B19 could not open the flaky channel');
+    $flakyBridge = new Bridge(32768, 262144, 5, 5, $flakyIn, $flakyOut);
+    $flakyCommand = $flakyBridge->nextCommand();
+    check(($flakyCommand['type'] ?? '') === 'prompt', 'B19 the bridge gave up after one empty read');
+    check(($flakyCommand['text'] ?? '') === 'after a dead read', 'B19 the retried command was mangled');
+    fclose($flakyIn);
+    fclose($flakyOut);
+    stream_wrapper_unregister('flakystream');
+
+    // --- B20: the dangling-channel diagnostic fires only when it should ------
+    $junkFile = tempnam(sys_get_temp_dir(), 'myagent-b20a-');
+    check(is_string($junkFile), 'B20 could not create the temp command file');
+    file_put_contents($junkFile, "\n"); // bytes present, but no usable command
+    $junkIn = fopen($junkFile, 'r');
+    $junkOut = fopen('php://memory', 'w+');
+    check(is_resource($junkIn) && is_resource($junkOut), 'B20 could not open the file channel');
+    $junkBridge = new Bridge(32768, 262144, 5, 5, $junkIn, $junkOut);
+    check($junkBridge->nextCommand() === null, 'B20 the empty command line was not skipped');
+    check($junkBridge->commandsDelivered() === 0, 'B20 a command line without a command was counted');
+    $junkWarning = $junkBridge->danglingInputWarning();
+    check(is_string($junkWarning) && str_contains($junkWarning, 'closed before any command'), 'B20 a dangling file channel was not reported');
+    fclose($junkIn);
+    fclose($junkOut);
+    @unlink($junkFile);
+
+    $emptyFile = tempnam(sys_get_temp_dir(), 'myagent-b20b-');
+    check(is_string($emptyFile), 'B20 could not create the empty command file');
+    $emptyIn = fopen($emptyFile, 'r');
+    $emptyOut = fopen('php://memory', 'w+');
+    check(is_resource($emptyIn) && is_resource($emptyOut), 'B20 could not open the empty channel');
+    $emptyBridge = new Bridge(32768, 262144, 5, 5, $emptyIn, $emptyOut);
+    check($emptyBridge->nextCommand() === null, 'B20 an empty file produced a command');
+    check($emptyBridge->danglingInputWarning() === null, 'B20 an empty input (like < NUL) must not warn');
+    fclose($emptyIn);
+    fclose($emptyOut);
+    @unlink($emptyFile);
+    // --- B21: a redirected command file reaches the bridge, end to end -------
+    // This is the user-visible symptom of docs/plans/IMPLEMENTATION_PLAN-bridge-file-stdin.md:
+    // `php agent.php --bridge < commands.jsonl` used to exit without a single command
+    // because Terminal::detect()'s console-width probe consumed the redirected stdin.
+    // The fixture mirrors that startup order (Terminal::detect() then Bridge) with no API.
+    $redirected = tempnam(sys_get_temp_dir(), 'myagent-b21-');
+    check(is_string($redirected), 'B21 could not create the command file');
+    file_put_contents(
+        $redirected,
+        json_encode(['v' => 1, 'type' => 'prompt', 'text' => 'from a redirected file'], JSON_UNESCAPED_SLASHES) . "\n"
+    );
+    $redirectDescriptors = [0 => ['file', $redirected, 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $redirectProcess = proc_open(
+        [PHP_BINARY, __DIR__ . '/fixtures/bridge-file-probe.php'],
+        $redirectDescriptors,
+        $redirectPipes,
+        dirname(__DIR__)
+    );
+    check(is_resource($redirectProcess), 'B21 could not start the bridge fixture');
+    $redirectStdout = (string) stream_get_contents($redirectPipes[1]);
+    $redirectStderr = (string) stream_get_contents($redirectPipes[2]);
+    fclose($redirectPipes[1]);
+    fclose($redirectPipes[2]);
+    $redirectExit = proc_close($redirectProcess);
+    @unlink($redirected);
+    check($redirectExit === 0, 'B21 the bridge fixture failed: ' . trim($redirectStderr));
+    check(
+        str_contains($redirectStdout, 'command=prompt'),
+        'B21 a redirected command file did not reach the bridge: ' . trim($redirectStdout)
+    );
+    check(
+        !str_contains($redirectStdout, 'command=none'),
+        'B21 the redirected command file was consumed before the bridge read it'
+    );
     fwrite(STDOUT, "Bridge tests passed\n");
 } catch (Throwable $e) {
     fwrite(STDERR, "FAIL: " . $e->getMessage() . "\n");

@@ -343,4 +343,43 @@ check(!str_contains($askOutput, "\033["), 'plain ask contains ANSI');
 check(str_contains($askOutput, '[?] Pick'), 'plain ask question changed');
 check(str_contains($askOutput, '2) Other - type your own answer'), 'plain ask Other line changed');
 
+// --- Terminal::detect(): the width probe must not consume a redirected stdin ---
+// The defect (docs/plans/IMPLEMENTATION_PLAN-bridge-file-stdin.md §1.2): the probe
+// shelled out with inherited stdin, so a redirected command file was gone by the
+// time the bridge read it.
+$widthFixture = dirname(__DIR__) . '/tests/fixtures/width-probe.php';
+$widthInput = tempnam(sys_get_temp_dir(), 'myagent-width-');
+check(is_string($widthInput), 'U-width-1 could not create the temp input');
+file_put_contents($widthInput, "first line\nsecond line\n");
+$widthBytes = (int) filesize($widthInput);
+$widthDescriptors = [0 => ['file', $widthInput, 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+$widthProcess = proc_open([PHP_BINARY, $widthFixture], $widthDescriptors, $widthPipes);
+check(is_resource($widthProcess), 'U-width-1 could not start the width probe fixture');
+$widthStdout = (string) stream_get_contents($widthPipes[1]);
+$widthStderr = (string) stream_get_contents($widthPipes[2]);
+fclose($widthPipes[1]);
+fclose($widthPipes[2]);
+$widthExit = proc_close($widthProcess);
+@unlink($widthInput);
+check($widthExit === 0, 'U-width-1 the width probe fixture failed: ' . trim($widthStderr));
+check(
+    preg_match('/width=(\d+) len=(\d+)/', $widthStdout, $widthMatch) === 1,
+    'U-width-1 unexpected fixture output: ' . trim($widthStdout)
+);
+check(
+    (int) $widthMatch[2] === $widthBytes,
+    'U-width-1 the width probe consumed stdin (' . (int) $widthMatch[2] . ' of ' . $widthBytes . ' bytes)'
+);
+check(
+    (int) $widthMatch[1] === 100,
+    'U-width-1 a run without a console should fall back to 100, got ' . $widthMatch[1]
+);
+
+// --- width precedence: explicit option, then COLUMNS, then the default --------
+check(Terminal::detect(['width' => 77])->width() === 77, 'U-width-2 an explicit width was ignored');
+$previousColumns = getenv('COLUMNS');
+putenv('COLUMNS=55');
+$fromColumns = Terminal::detect([]);
+putenv($previousColumns === false ? 'COLUMNS' : 'COLUMNS=' . $previousColumns);
+check($fromColumns->width() === 55, 'U-width-2 COLUMNS was ignored, got ' . $fromColumns->width());
 fwrite(STDOUT, "UI tests passed\n");
