@@ -1632,7 +1632,10 @@ final class Agent
             }
             $this->checkpoint(true, []);
         }
-        $this->terminal->warning("Step limit ({$this->maxSteps}) reached with work in progress. Resume with --session --continue.");
+        $resumeHint = $this->store !== null
+            ? ' --session=' . $this->store->name() . ' --continue'
+            : ' --session=NAME --continue';
+        $this->terminal->warning("Step limit ({$this->maxSteps}) reached with work in progress. Resume with{$resumeHint}.");
         return false;
     }
 

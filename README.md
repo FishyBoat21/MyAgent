@@ -133,7 +133,7 @@ In an interactive terminal MyAgent renders a styled session:
 │ model      deepseek-flash                                │
 │ effort     high                                          │
 │ workspace  D:\Project\MyAgent                            │
-│ session    refactor                                      │
+│ session    session-20261101-085612-08f355 (new)          │
 │ identity    myagent                                       │
 │ security   reviewer deepseek-flash · fail-closed         │
 │ tools      5 local · 1 MCP server                        │
@@ -208,16 +208,34 @@ php tests/render-demo.php --force --color=never --ascii --width=60
 
 ## Long tasks and recovery
 
-Give a task a session name to save progress under `.agent/sessions/`:
+Every run is a session. MyAgent checkpoints under `.agent/sessions/` before and after each
+tool call, so work is resumable even when you never named anything. Without `--session` a
+random id is generated (`session-<date>-<time>-<random hex>`); the banner, `/session`, and
+the one-line notice printed by a headless run all show it.
 
 ```sh
-php agent.php --session=refactor "Refactor the parser and run its tests"
-php agent.php --session=refactor --continue
+php agent.php "Refactor the parser and run its tests"       # new random session
+php agent.php --session=refactor "Refactor the parser"      # named session
+php agent.php --continue                                    # most recent session
+php agent.php --session=refactor --continue                 # that named session
 ```
 
-The second command continues if the first process was interrupted or reached `max_steps` (100 model calls by default, per invocation). Repeating `--continue` gives it another step budget. A new prompt with the same session name adds instructions to that conversation. When stdin is not a terminal (piped input), exit code `2` means the step limit was reached with work unfinished and exit code `1` means an error; an interactive terminal keeps the session open instead, and only `Ctrl+C` ends it. Session checkpoints include messages and tool outputs, so keep `.agent/` private; it is gitignored. The API key is never saved there.
+`--continue` resumes the named session, or the most recently written checkpoint when no
+name is given, and continues if that process was interrupted or reached `max_steps` (100
+model calls by default, per invocation). Repeating `--continue` gives it another step
+budget. A new prompt with the same session name adds instructions to that conversation.
+When stdin is not a terminal (piped input), exit code `2` means the step limit was reached
+with work unfinished and exit code `1` means an error; an interactive terminal keeps the
+session open instead, and only `Ctrl+C` ends it. Session checkpoints include messages and
+tool outputs, so keep `.agent/` private and add it to the project's `.gitignore` (this repository already ignores it). The API key is never saved
+there. Checkpoints are never pruned automatically — delete `.agent/sessions/*.json` (and
+the matching `.lock`) when a session is no longer needed. If `.agent/sessions/` cannot be
+created (a read-only workspace) or the session is locked by another process, an unnamed run
+warns and continues without a checkpoint; an explicitly named session fails instead.
 
-In interactive mode, type `/continue` to give an unfinished task another step budget without adding a new user message.
+In interactive mode, `/session` prints the session name, its checkpoint and the exact
+resume command, and `/continue` gives an unfinished task another step budget without
+adding a new user message.
 
 A model `stop` (`end_turn`) only ends the current turn, never the session: a single-task run drops into the same `you>` prompt for follow-ups. End-of-input in a terminal (`Ctrl+D`, or `Ctrl+Z` then Enter on Windows) is ignored too — the console is reopened so the session keeps waiting for the user.
 
@@ -436,7 +454,7 @@ reject another version: the bridge answers
 
 | Type | Payload |
 |---|---|
-| `ready` | `session, workspace, model, effort, identity, security{model,fail_closed,enabled}, tools, mcp[], pid, ask_user, media{enabled,images,max_bytes,max_edge,store}` |
+| `ready` | `session, session_new, workspace, model, effort, identity, security{model,fail_closed,enabled}, tools, mcp[], pid, ask_user, media{enabled,images,max_bytes,max_edge,store}` |
 | `turn_start` / `turn_end` | `prompt` (null for a resume) / `complete` (false = step limit) |
 | `assistant` | `text` — raw Markdown |
 | `tool_start` / `tool_result` | `id, name, input` / `+ result, result_truncated, result_bytes, is_error, duration, media[]` |

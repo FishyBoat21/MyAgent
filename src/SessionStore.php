@@ -8,6 +8,7 @@ use RuntimeException;
 final class SessionStore
 {
     private string $path;
+    private string $name;
     private mixed $lock;
 
     public function __construct(string $root, string $name)
@@ -24,6 +25,7 @@ final class SessionStore
         if ($base === false || $resolved === false || !str_starts_with(strtolower($resolved), strtolower(rtrim($base, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR))) {
             throw new RuntimeException('Session directory escapes project');
         }
+        $this->name = $name;
         $this->path = $directory . '/' . $name . '.json';
         $this->lock = fopen($directory . '/' . $name . '.lock', 'c');
         if ($this->lock === false || !flock($this->lock, LOCK_EX | LOCK_NB)) {
@@ -32,6 +34,56 @@ final class SessionStore
             }
             throw new RuntimeException('Session is already open in another process');
         }
+    }
+
+    /** The name this store writes under, e.g. for resume hints and the banner. */
+    public function name(): string
+    {
+        return $this->name;
+    }
+
+    /**
+     * A fresh name for a run that did not pick one. Sessions are always on, so
+     * an unnamed process still needs an identifier: a readable timestamp plus
+     * random bytes, which also satisfies the store's name grammar.
+     */
+    public static function randomName(): string
+    {
+        return 'session-' . date('Ymd-His') . '-' . bin2hex(random_bytes(3));
+    }
+
+    /**
+     * The most recently written checkpoint under <root>/.agent/sessions, or
+     * null when the project has no sessions yet. Used by `--continue` when the
+     * caller did not name a session.
+     */
+    public static function latest(string $root): ?string
+    {
+        $directory = $root . '/.agent/sessions';
+        if (!is_dir($directory)) {
+            return null;
+        }
+        $files = glob($directory . '/*.json');
+        if ($files === false) {
+            return null;
+        }
+        $latest = null;
+        $latestTime = null;
+        foreach ($files as $file) {
+            $name = basename($file, '.json');
+            if (preg_match('/^[a-zA-Z0-9_-]{1,64}$/', $name) !== 1) {
+                continue;
+            }
+            $modified = @filemtime($file);
+            if ($modified === false) {
+                continue;
+            }
+            if ($latestTime === null || $modified > $latestTime) {
+                $latest = $name;
+                $latestTime = $modified;
+            }
+        }
+        return $latest;
     }
 
     public function load(): ?array

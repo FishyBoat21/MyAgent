@@ -1,0 +1,10 @@
+{
+  "api_key": "test-key-never-used",
+  "api_url": "https://api.anthropic.com/v1/messages",
+  "model": "deepseek-flash",
+  "max_steps": 1,
+  "mcpServers": {},
+  "security": {
+    "enabled": false
+  }
+}

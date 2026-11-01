@@ -359,6 +359,94 @@ try {
     @unlink($root . '/.agent/sessions/' . $sessionName . '.lock');
 }
 
+// --- Always-on sessions ------------------------------------------------------
+// Every run checkpoints, so an unnamed process needs a generated id, and
+// --continue must be able to find the newest checkpoint.
+$autoName = SessionStore::randomName();
+check(preg_match('/^[a-zA-Z0-9_-]{1,64}$/', $autoName) === 1, 'Generated session name is not usable: ' . $autoName);
+check(SessionStore::randomName() !== $autoName, 'Generated session names repeat');
+$emptyState = ['version' => 1, 'model' => 'test', 'in_progress' => false, 'pending_results' => [], 'messages' => []];
+$scratchRoot = $root . '/.agent/session-store-' . getmypid();
+@mkdir($scratchRoot, 0700, true);
+check(SessionStore::latest($scratchRoot) === null, 'An empty project reported a latest session');
+$olderStore = new SessionStore($scratchRoot, 'older-session');
+$olderStore->save($emptyState);
+@touch($scratchRoot . '/.agent/sessions/older-session.json', time() - 120);
+unset($olderStore);
+$newerStore = new SessionStore($scratchRoot, $autoName);
+$newerStore->save($emptyState);
+check($newerStore->name() === $autoName, 'The session store forgot its own name');
+check(SessionStore::latest($scratchRoot) === $autoName, 'The newest checkpoint was not reported as latest');
+check(SessionStore::latest($root . '/.agent/no-such-project') === null, 'A missing session directory reported a latest session');
+unset($newerStore);
+foreach (glob($scratchRoot . '/.agent/sessions/*') ?: [] as $scratchFile) {
+    @unlink($scratchFile);
+}
+@rmdir($scratchRoot . '/.agent/sessions');
+@rmdir($scratchRoot . '/.agent');
+@rmdir($scratchRoot);
+
+// The CLI itself must open a session without being asked: every run checkpoints,
+// an unnamed run gets a random id, and the id is reported to the caller.
+$runCli = static function (string $workspace, string $arguments) use ($root): array {
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $process = proc_open(
+        [PHP_BINARY, '-d', 'opcache.enable_cli=0', $root . '/agent.php', ...explode(' ', $arguments)],
+        $descriptors,
+        $pipes,
+        $workspace
+    );
+    if (!is_resource($process)) {
+        throw new RuntimeException('Could not start agent.php');
+    }
+    fclose($pipes[0]);
+    $stdout = (string) stream_get_contents($pipes[1]);
+    $stderr = (string) stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $code = proc_close($process);
+    $events = [];
+    foreach (preg_split('/\R/', trim($stdout)) ?: [] as $line) {
+        $event = json_decode($line, true);
+        if (is_array($event)) {
+            $events[] = $event;
+        }
+    }
+    return ['code' => $code, 'events' => $events, 'stderr' => $stderr];
+};
+$cliRoot = sys_get_temp_dir() . '/myagent-session-cli-' . getmypid() . '-' . bin2hex(random_bytes(2));
+mkdir($cliRoot, 0700, true);
+$cliConfig = $root . '/tests/fixtures/session-config.json';
+// Headless (no bridge, no prompt): the run still opens a session and prints it.
+$headless = $runCli($cliRoot, '--config=' . $cliConfig);
+check($headless['code'] === 0, 'A headless run failed: ' . trim($headless['stderr']));
+check(preg_match('/session +([a-zA-Z0-9_-]+) \(new\)/', $headless['stderr'], $headlessName) === 1,
+    'A headless run did not print its session name: ' . trim($headless['stderr']));
+check(is_dir($cliRoot . '/.agent/sessions'), 'The CLI did not create the session directory');
+// Bridge mode reports the same fact on the event stream.
+$firstRun = $runCli($cliRoot, '--bridge --config=' . $cliConfig);
+$firstReady = $firstRun['events'][0] ?? [];
+check($firstRun['code'] === 0, 'A piped bridge run failed: ' . trim($firstRun['stderr']));
+check(($firstReady['type'] ?? '') === 'ready', 'The first bridge event was not ready');
+check(is_string($firstReady['session'] ?? null) && $firstReady['session'] !== '',
+    'An unnamed run did not open a session');
+check(preg_match('/^[a-zA-Z0-9_-]{1,64}$/', (string) $firstReady['session']) === 1,
+    'The generated session name is not usable: ' . (string) ($firstReady['session'] ?? ''));
+check(($firstReady['session_new'] ?? null) === true, 'A generated session was not reported as new');
+check(($firstReady['session'] ?? null) !== $headlessName[1], 'Two unnamed runs reused the same session name');
+$namedRun = $runCli($cliRoot, '--bridge --session=cli-named --config=' . $cliConfig);
+$namedReady = $namedRun['events'][0] ?? [];
+check($namedRun['code'] === 0, 'A named piped bridge run failed: ' . trim($namedRun['stderr']));
+check(($namedReady['session'] ?? null) === 'cli-named', '--session did not win over the generated name');
+foreach (glob($cliRoot . '/.agent/sessions/*') ?: [] as $cliFile) {
+    @unlink($cliFile);
+}
+@rmdir($cliRoot . '/.agent/sessions');
+@rmdir($cliRoot . '/.agent');
+@rmdir($cliRoot . '/.agent/media');
+@rmdir($cliRoot . '/.agent/media/inbox');
+@rmdir($cliRoot);
+
 // --- Outgoing payload encoding -----------------------------------------------
 
 $encoder = new class('unused') extends AnthropicClient {

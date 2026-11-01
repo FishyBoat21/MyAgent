@@ -52,8 +52,8 @@ if (isset($options['help'])) {
     $help->out("  --image=FILE            Attach an image to the first task (repeatable)\n");
     $help->out("  --no-media              Disable image input for this process\n");
     $help->out("  --media-max-edge=N      Downscale images to this long edge (0 = never)\n");
-    $help->out("  --session=NAME          Save/restore progress under .agent/sessions/\n");
-    $help->out("  --continue              Resume an unfinished named session\n");
+    $help->out("  --session=NAME          Checkpoint under .agent/sessions/NAME (default: a random id)\n");
+    $help->out("  --continue              Resume the named (or the most recent) session\n");
     $help->out("  --plain                 Raw output for scripts and logs\n");
     $help->out("  --no-color              Disable ANSI colors\n");
     $help->out("  --width=N               Force terminal width (40-200)\n");
@@ -71,6 +71,7 @@ if (isset($options['help'])) {
     $help->out("  /detach [n|all]         Drop a queued image, or all of them\n");
     $help->out("  /paste                  Attach the clipboard image (Windows)\n");
     $help->out("  /media                  Show image capability, limits and usage\n");
+    $help->out("  /session                Show the session name and how to resume it\n");
     $help->out("  /continue               Give unfinished work another step budget\n");
     $help->out("  /help                   Show this command list\n");
     $help->out("  Ctrl+C                  Exit the session\n");
@@ -347,7 +348,31 @@ try {
         $selector = $isTty ? new ModelSelector($readLine, null, $ui) : new ModelSelector();
     }
     $local = new LocalTools($root, $skills, $commandTimeout, $askUser, $mediaNormalizer);
-    $store = isset($options['session']) ? new SessionStore($root, (string) $options['session']) : null;
+    // Sessions are always on: every run checkpoints under .agent/sessions, so the
+    // work is resumable even when the caller never picked a name. An unnamed run
+    // gets a random id, and --continue without a name continues the most recent
+    // checkpoint instead of failing.
+    $requestedSession = isset($options['session']) ? trim((string) $options['session']) : '';
+    if ($requestedSession === '' && isset($options['continue'])) {
+        $requestedSession = (string) SessionStore::latest($root);
+        if ($requestedSession === '') {
+            throw new RuntimeException('--continue needs a saved session: .agent/sessions/ is empty');
+        }
+        $ui->info('Continuing the most recent session: ' . $requestedSession);
+    }
+    $sessionName = $requestedSession !== '' ? $requestedSession : SessionStore::randomName();
+    $sessionResumed = is_file($root . '/.agent/sessions/' . $sessionName . '.json');
+    $store = null;
+    try {
+        $store = new SessionStore($root, $sessionName);
+    } catch (RuntimeException $e) {
+        // A named session must work; an automatic one may degrade (read-only
+        // workspace, session locked elsewhere) instead of blocking the run.
+        if (isset($options['session']) || isset($options['continue'])) {
+            throw $e;
+        }
+        $ui->warning('session: ' . $e->getMessage() . ' (running without a checkpoint)');
+    }
 
     // A resumed session restores the model/effort it was using, unless the
     // command line overrides them. Explicit flags always win.
@@ -557,7 +582,8 @@ try {
     if ($bridge !== null) {
         $agent->setProgressHook($bridge->progressHook());
         $bridge->emit('ready', [
-            'session' => isset($options['session']) ? (string) $options['session'] : null,
+            'session' => $store !== null ? $sessionName : null,
+            'session_new' => $store !== null && !$sessionResumed,
             'workspace' => $root,
             'model' => (string) $model,
             'effort' => $effort,
@@ -713,9 +739,9 @@ try {
         'model' => (string) $model,
         'effort' => $effort ?? 'provider default',
         'workspace' => $root,
-        'session' => isset($options['session'])
-            ? (string) $options['session'] . (isset($options['continue']) ? ' (resume)' : '')
-            : null,
+        'session' => $store === null
+            ? null
+            : $sessionName . ($sessionResumed ? ' (resumed)' : ' (new)'),
         'identity' => $userId . ($sendMetadata ? '' : ' (metadata off)'),
         'security' => $security !== null
             ? 'reviewer ' . $reviewerModel . ((bool) ($securityOptions['fail_closed'] ?? true) ? ' · fail-closed' : '')
@@ -728,6 +754,12 @@ try {
                 ? 'supported · ' . $mediaLimits->maxEdge . ' px · ' . Mime::formatBytes($mediaLimits->maxBytes)
                 : 'model has no image input'),
     ]);
+    if (!$bannerShown && $store !== null) {
+        // No banner (plain output or a redirected STDERR): name the session
+        // anyway so a script can resume it later.
+        $ui->info('session     ' . $sessionName . ($sessionResumed ? ' (resumed)' : ' (new)')
+            . ' · .agent/sessions/' . $sessionName . '.json');
+    }
     foreach ($mcpStatuses as $status) {
         if ($status[0] === 'ok') {
             $ui->info("MCP {$status[1]} connected ({$status[2]} tools)");
@@ -821,8 +853,11 @@ try {
 
     $complete = true;
     if (isset($options['continue'])) {
-        if ($store === null || $prompt !== '') {
-            throw new RuntimeException('--continue requires --session=NAME and no new prompt');
+        if ($store === null) {
+            throw new RuntimeException('--continue needs a writable session checkpoint');
+        }
+        if ($prompt !== '') {
+            throw new RuntimeException('--continue takes no new prompt; type the instruction at the prompt instead');
         }
         $complete = $agent->resume();
     } elseif ($prompt !== '') {
@@ -936,7 +971,25 @@ try {
         }
         $promptShown = false;
         $complete = true;
-        if ($input === '/continue') {
+        if ($input === '/session') {
+            $checkpoint = null;
+            $checkpointError = null;
+            try {
+                $checkpoint = $store?->load();
+            } catch (RuntimeException $e) {
+                // A damaged checkpoint must not end the session: report it.
+                $checkpointError = $e->getMessage();
+            }
+            $ui->info('session     ' . $sessionName);
+            $ui->info('checkpoint  .agent/sessions/' . $sessionName . '.json'
+                . ($checkpointError !== null
+                    ? ' · ' . $checkpointError
+                    : ($checkpoint === null
+                        ? ' (empty)'
+                        : ' · ' . count((array) ($checkpoint['messages'] ?? [])) . ' message(s)'
+                            . ((bool) ($checkpoint['in_progress'] ?? false) ? ' · unfinished' : ''))));
+            $ui->info('resume      php agent.php --session=' . $sessionName . ' --continue');
+        } elseif ($input === '/continue') {
             $complete = $agent->resume();
         } elseif ($input === '/help') {
             $ui->err($ui->styleErr('Commands', 'bold', 'accent') . "\n");
@@ -949,6 +1002,7 @@ try {
                 '/paste              Attach the clipboard image (Windows)',
                 '/media              Show image capability, limits and usage',
                 '/cache              Show identity, breakpoints and cache hit rate',
+                '/session            Show the session name and how to resume it',
                 '/continue           Give unfinished work another step budget',
                 '/help               Show this command list',
                 'Ctrl+C              Exit the session',
