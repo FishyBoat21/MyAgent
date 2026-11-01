@@ -143,6 +143,36 @@ final class ModelCatalog
         return is_string($default) && in_array($default, self::EFFORT_ORDER, true) ? $default : null;
     }
 
+    /**
+     * Input modalities read from the on-disk cache only: never performs a request,
+     * so startup capability detection stays off the network.
+     *
+     * @return list<string>
+     */
+    public function cachedInputModalities(string $id): array
+    {
+        foreach ($this->readCache(false) ?? [] as $model) {
+            if (($model['id'] ?? null) === $id) {
+                return (array) ($model['input_modalities'] ?? []);
+            }
+        }
+        return [];
+    }
+
+    /**
+     * Input modalities the provider declares for a model ([] when unknown).
+     *
+     * The catalog is a declaration, not a guarantee: callers fall back to
+     * media.input_modalities when this is empty.
+     *
+     * @return list<string>
+     */
+    public function inputModalities(string $id): array
+    {
+        $model = $this->find($id);
+        return $model === null ? [] : (array) ($model['input_modalities'] ?? []);
+    }
+
     /** live|cache|static|none */
     public function source(): string
     {
@@ -187,6 +217,9 @@ final class ModelCatalog
             if ($effort === [] && is_array($capabilities['effort'] ?? null)) {
                 $effort = $capabilities['effort'];
             }
+            $modalities = self::sanitizeModalities(
+                $entry['input_modalities'] ?? ($capabilities['input_modalities'] ?? null)
+            );
 
             $levels = self::sanitizeLevels($effort['supported_levels'] ?? []);
             $default = self::normalizeEffortValue($effort['default_level'] ?? null);
@@ -201,6 +234,7 @@ final class ModelCatalog
                 'max_output_tokens' => self::intOrNull($entry['max_output_tokens'] ?? $entry['max_tokens'] ?? null),
                 'effort_levels' => $levels,
                 'default_effort' => $default,
+                'input_modalities' => $modalities,
             ];
         }
         return $models;
@@ -243,6 +277,7 @@ final class ModelCatalog
                 'max_output_tokens' => self::intOrNull($entry['max_output_tokens'] ?? null),
                 'effort_levels' => $levels,
                 'default_effort' => $default,
+                'input_modalities' => self::sanitizeModalities($entry['input_modalities'] ?? null),
             ];
         }
         return $models;
@@ -412,6 +447,35 @@ final class ModelCatalog
                 @unlink($temp);
             }
         }
+    }
+
+    /**
+     * Keep only known modality names, in canonical order.
+     *
+     * @return list<string>
+     */
+    private static function sanitizeModalities(mixed $value): array
+    {
+        if (is_string($value)) {
+            $value = preg_split('/[\s,|]+/', $value) ?: [];
+        }
+        if (!is_array($value)) {
+            return [];
+        }
+        $seen = [];
+        foreach ($value as $item) {
+            if (!is_string($item)) {
+                continue;
+            }
+            $item = strtolower(trim($item));
+            if (in_array($item, ['text', 'image', 'document', 'audio', 'video'], true)) {
+                $seen[$item] = true;
+            }
+        }
+        return array_values(array_filter(
+            ['text', 'image', 'document', 'audio', 'video'],
+            static fn(string $name): bool => isset($seen[$name])
+        ));
     }
 
     /** @return list<string> */

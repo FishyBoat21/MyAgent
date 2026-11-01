@@ -276,6 +276,7 @@ final class Terminal
             'security' => 'security',
             'tools' => 'tools',
             'mcp' => 'mcp',
+            'images' => 'images',
         ];
         $rows = [];
         foreach ($labels as $key => $label) {
@@ -376,9 +377,18 @@ final class Terminal
         $this->err(Ansi::truncate($line, $this->width()) . "\n");
     }
 
-    /** @param array<string, mixed> $input */
-    public function toolResult(string $name, array $input, string $result, bool $isError, float $duration): void
-    {
+    /**
+     * @param array<string, mixed> $input
+     * @param list<array<string, mixed>> $media Image descriptors (never bytes)
+     */
+    public function toolResult(
+        string $name,
+        array $input,
+        string $result,
+        bool $isError,
+        float $duration,
+        array $media = []
+    ): void {
         $toolId = null;
         if (($this->toolIds[$name] ?? []) !== []) {
             $toolId = array_pop($this->toolIds[$name]);
@@ -393,6 +403,7 @@ final class Terminal
             'result_bytes' => $eventBytes,
             'is_error' => $isError,
             'duration' => round($duration, 4),
+            'media' => $media,
         ]);
         $content = Ansi::sanitize($result);
         $firstLine = $this->firstLine($content);
@@ -699,6 +710,7 @@ final class Terminal
         $bytes = strlen($content);
         return match ($name) {
             'read_file', 'read_skill' => "{$lines} lines · {$bytes} B",
+            'read_image' => $this->firstLine($content),
             'write_file' => $this->firstLine($content),
             'list_files' => $content === '(empty)' ? 'empty' : "{$lines} entries",
             'run_command' => $this->runCommandSummary($content),

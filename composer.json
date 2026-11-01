@@ -17,11 +17,15 @@
         ]
     },
     "scripts": {
-        "test": "@php tests/smoke.php && @php tests/bridge.php",
+        "test": "@php tests/smoke.php && @php tests/media.php && @php tests/bridge.php",
+        "test:media": "@php tests/media.php",
         "test:bridge": "@php tests/bridge.php",
         "test:ui": "@php tests/ui.php",
         "test:selector": "@php tests/selector.php",
         "demo": "@php tests/render-demo.php --force --color=always --width=100"
+    },
+    "suggest": {
+        "ext-gd": "Needed to downscale images before they are sent to the model"
     },
     "config": {
         "optimize-autoloader": true,

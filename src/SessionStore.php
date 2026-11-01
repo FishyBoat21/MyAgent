@@ -43,7 +43,10 @@ final class SessionStore
             return null;
         }
         $state = json_decode((string) file_get_contents($this->path), true, 512, JSON_THROW_ON_ERROR);
-        if (!is_array($state) || ($state['version'] ?? null) !== 1 || !is_array($state['messages'] ?? null)) {
+        // Version 2 marks a checkpoint written with media markers. Older binaries
+        // reject it instead of posting unknown block sources to the API.
+        if (!is_array($state) || !in_array($state['version'] ?? null, [1, 2], true)
+            || !is_array($state['messages'] ?? null)) {
             throw new RuntimeException('Invalid session file: ' . $this->path);
         }
         return $state;
