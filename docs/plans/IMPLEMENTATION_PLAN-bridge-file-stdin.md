@@ -2,7 +2,8 @@
 
 **Revision:** 1 (2026-11-01)
 **Target repo:** `D:\Project\MyAgent` (PHP 8.4.22 NTS on Windows, Composer autoloading, no third-party packages)
-**Status:** **Planned / NOT implemented** — this document only; no source file is touched by it.
+**Status:** **Implemented** (2026-11-01) — see §9 for the record, the verification log and the one
+correction to §3.2/M3 that the fix itself revealed.
 **Baseline:** `6382970` (`docs(media): document image input and record the implementation`), working tree clean,
 `composer test` green.
 **Severity:** low for production supervisors (they spawn with pipes), medium for humans and for anyone
@@ -264,6 +265,12 @@ Bounded by `3 × 5 ms` per empty read, so a genuinely closed pipe still exits im
 path only applies to regular files that advertise unread bytes). No public API change; `Bridge::VERSION`
 stays `1`; the wire format is untouched.
 
+**What this can and cannot do (measured after implementation):** the retry recovers a *transient*
+empty read — proved by the `flaky-stream` double (B19, which fails against the pre-fix `Bridge`). It
+cannot recover bytes a child process already consumed: in the real failure mode the shared position
+is past the data, so the retries exhaust and the channel still ends. What M3 adds there is the
+diagnostic, not a rescue — **M2 is the actual fix**; M3 is defence in depth plus observability.
+
 ### 3.3 Diagnostics for a channel that ends before its first command
 
 At the end of the command loop in `agent.php`, when `$commandsProcessed === 0` and
@@ -322,8 +329,9 @@ Each milestone ends with `php -l` on the touched files plus the named suite.
 
 - **Files modified:** `src/Bridge.php` (§3.2).
 - **Validation:** `php -l src/Bridge.php`, `php tests/bridge.php` (existing B1–B17 stay green).
-- **Exit criteria:** with M2 reverted (temporarily, locally) the bridge still survives the consumed-file
-  case, i.e. defence in depth is real, not theoretical. Record the result in §9.3.
+- **Exit criteria:** a single spurious empty read no longer ends the channel (B19, red against the
+  pre-fix `Bridge`), and a genuinely consumed command file reports `danglingInputWarning()` instead of
+  exiting silently. The retry cannot *recover* consumed bytes — see the correction in §3.2.
 
 ### M4 — Regression tests
 
@@ -444,6 +452,7 @@ user-visible difference after reverting is the defect coming back.
 |---|---|
 | `tests/fixtures/bridge-file-probe.php` | Minimal reproducer: `Terminal::detect()` + `Bridge` over STDIN, prints `command=<type>`; fails today with a redirected file. |
 | `tests/fixtures/flaky-stream.php` | Userland stream wrapper that returns `''` on the first read — the EOF-discipline test double. |
+| `tests/fixtures/width-probe.php` | Subprocess fixture for `tests/ui.php`: `Terminal::detect()` then a raw stdin read, printing `width=<n> len=<n>` (§9.2 records why this is a second fixture). |
 
 ### Modified files
 
@@ -452,7 +461,7 @@ user-visible difference after reverting is the defect coming back.
 | `src/Terminal.php` | `< NUL` on the Windows probe; `hasConsole()` gate before probing; comment naming the failure mode. |
 | `src/Bridge.php` | `EMPTY_READ_RETRIES`, `streamLooksUnread()`, bounded retry instead of latching `eof` on one empty read; accessor for the diagnostics. |
 | `agent.php` | One conditional diagnostic at the end of the bridge loop (counter of processed commands). |
-| `tests/bridge.php` | B18–B20. |
+| `tests/bridge.php` | B18–B21 (file-backed channel, empty-read retry, dangling diagnostic, redirected-file end to end). |
 | `tests/ui.php` | Two width-probe cases (subprocess with a redirected stdin). |
 | `README.md` | Bridge section: a redirected command file is supported; `COLUMNS`/`--width` note. |
 
@@ -479,25 +488,104 @@ Three reviewable commits, each independently green:
 
 ## 9. Implementation Record
 
-**Status: NOT implemented.** Fill in as milestones complete (same pattern as the other plans in this
-folder).
+**Status: IMPLEMENTED (2026-11-01).** M0–M5 are complete and every DoD item in §1.3 is checked off below.
 
 ### 9.1 M0 evidence (commands + exact output)
 
-_pending_
+Bisect (one destructive `fread(STDIN, 65536)` per run, inserted into a throwaway `agent-probe.php`):
+
+```text
+[read@config]        feof=n ftell=0 len=196   <- before Terminal::detect()
+[read@after-terminal-detect] feof=n ftell=0 len=0
+[read@after-flagvalues]      len=0
+[read@after-limits]          len=0
+[read@after-store]           len=0
+[read@after-prune]           len=0
+[read@mcp] / [read@preready] / [read@preloop]  len=0
+```
+
+Minimal mechanism (`shell_exec` then one read, no MyAgent code):
+
+```text
+shell_exec('mode con 2>NUL')       -> read len=0      (stdin consumed)
+shell_exec('mode con 2>NUL < NUL') -> read len=196    (stdin intact)
+same, command file on a pipe       -> read len=196    (pipes have no shared position)
+```
+
+M1 reproducer before the fix:
+
+```text
+php tests/fixtures/bridge-file-probe.php < .agent\bridge-probe.jsonl  -> width=120 command=none
+type .agent\bridge-probe.jsonl | php tests\fixtures\bridge-file-probe.php -> width=120 command=prompt
+```
 
 ### 9.2 Decisions changed during implementation
 
-_pending_
+1. **M3 was mis-specified in §4 and is corrected in §3.2.** The plan's exit criterion claimed the bridge
+   hardening would "still survive the consumed-file case" with M2 reverted. It cannot: once a child has
+   consumed the bytes the shared position is past them and no retry can bring them back. Measured with
+   the new `Bridge`: `command=none, delivered=0, warning=the command channel closed before any command
+   was read …`. So **M2 is the fix**, and M3 is (a) protection against a single transient empty read and
+   (b) the diagnostic. Recorded rather than quietly reworded.
+2. **A second fixture was needed.** `tests/fixtures/bridge-file-probe.php` proves the command channel end
+   to end, but the width-probe assertion needs the raw byte count of stdin after `Terminal::detect()`;
+   that is `tests/fixtures/width-probe.php` (`width=<n> len=<n>`), run as a subprocess from `tests/ui.php`
+   because a process cannot re-redirect its own stdin.
+3. **The `hasConsole()` gate changes the width of piped/redirected runs from the console-derived value to
+   `100`.** `mode con` queries the console device directly, so before this change a piped run still got
+   the console width (e.g. 120). Both `tests/ui.php` and `tests/smoke.php` stayed green with the change, and
+   explicit widths (`--width`, `COLUMNS`) are unaffected. Kept, because the alternative is spawning a child
+   on every supervised session for a width that is not visible to anyone.
+4. **The diagnostic is emitted as both a STDERR line and one `warning` event**, so a supervisor parsing
+   STDOUT sees it too. It is gated on "regular file with bytes and zero decoded commands", which keeps
+   `< NUL` and closed pipes byte-identical to before (asserted by B20).
+5. **The commit order of §8 was swapped: the `Bridge` hardening lands first, then the `Terminal` fix.**
+   `tests/bridge.php` is one file, and B18–B20 (which need the new `Bridge` API) plus B21 (which needs the
+   `Terminal` fix) live in it, so the only way to keep every commit green is to put the file in the second
+   commit. An extra `B21` was added beyond the plan: the exact user-visible symptom, as an end-to-end
+   subprocess test (`php tests/fixtures/bridge-file-probe.php < commands.jsonl` must print `command=prompt`).
 
 ### 9.3 Verification performed
 
-_pending_
+Suites (all green):
+
+```text
+composer validate                 -> ./composer.json is valid
+composer test                     -> UI / Selector / Media / Smoke / Bridge passed
+php tests/ui.php                  -> UI tests passed (incl. the two new width cases)
+php tests/selector.php            -> Selector tests passed
+php tests/media.php               -> Media tests passed
+php tests/render-demo.php --force --color=always --width=100 -> renders (56 lines)
+```
+
+The three channel shapes, after the fix:
+
+```text
+php agent.php --bridge < .agent\bridge-probe.jsonl   -> ready, attachment, turn_start, assistant, turn_end{complete:true}, bye
+type .agent\bridge-probe.jsonl | php agent.php --bridge -> identical events
+php agent.php --bridge < NUL                         -> ready, bye{idle-exit,0} (no warning, unchanged)
+```
+
+Regression proofs (each new test is red against the pre-fix code):
+
+- **B19** against `git show HEAD:src/Bridge.php` → `old Bridge command=none (B19 would FAIL)`.
+- **U-width-1** against `git show HEAD:src/Terminal.php` → `old Terminal width=120 len=0 (U-width-1 would
+  FAIL)`; after the fix the same fixture reports `len=<file size>` and `width=100`.
+- **B18** proves a file-backed channel delivers (`commandsDelivered() === 1`, no warning); **B20** proves
+  the diagnostic fires for a file with bytes and no command, and stays silent for an empty file.
+
+The real failure mode still ends the channel if something consumes stdin, but no longer silently — see
+the measured `warning=` line in §9.2-1.
 
 ### 9.4 Known limitations after the fix
 
-_pending_
-
+- The retry is a guard against a *transient* empty read, not a recovery mechanism; nothing can un-consume
+  bytes a child process read (M2 prevents that child from existing in the first place).
+- A run with no console now reports `width=100` unless `--width` or `COLUMNS` is set. That is the
+  documented fallback, but it is a visible change for piped runs that used to inherit the console width.
+- Windows-only regression coverage: the width probe is a Windows branch, so `U-width-1` exercises the
+  skip path on other platforms (fine — the POSIX branch already redirected) and B18–B20 are
+  platform-neutral.
 ---
 
 ## 10. Open Questions (before M1)

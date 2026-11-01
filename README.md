@@ -466,6 +466,14 @@ Inline base64 attachments are rejected with `{"type":"media_error","reason":"inl
 — the line cap is 4 MiB and paths keep the workspace check meaningful. A bad path produces one
 `media_error` and the prompt still runs with the attachments that resolved.
 
+**Delivering commands.** The channel can be a pipe (`type cmds.jsonl | php agent.php --bridge`) or a
+redirected file (`php agent.php --bridge < cmds.jsonl`); both are read the same way, one JSON object
+per line. A redirected file that ends before a single command could be read is no longer silent: the
+bridge prints one line on STDERR and emits one `warning` event, while an empty input (`< NUL`) and a
+pipe that closes normally stay silent. The console-width probe is skipped when neither STDIN nor
+STDOUT is a terminal, so a redirected or supervised run does not spawn `mode con`; `--width=N` and
+`COLUMNS` still win, and a run without a console falls back to 100 columns.
+
 In bridge mode `ask_user` stays advertised (`"ask_user": true` in `ready`) because the
 bridge installs a non-null reader: questions are asked over the command channel and
 answered by the supervisor. A security-reviewer `ask` verdict likewise becomes an
@@ -479,7 +487,7 @@ Without `--bridge`, MyAgent behaves exactly as before.
 
 ## Verify
 
-Run `composer test` (equivalently, `php tests/smoke.php && php tests/bridge.php`). The smoke test checks local skills and files, starts the bundled stdio MCP example, and exercises tool use, session recovery, compaction handling, the `ask_user` prompt with scripted input, and the security reviewer with fake Anthropic responses. It also runs `tests/ui.php`, which covers ANSI sanitizing, width/wrapping, Markdown rendering, tool summaries, plain-mode compatibility, and the styled/plain agent output paths, `tests/selector.php`, which covers model/effort catalog normalization, clamping, request-body construction, reviewer effort isolation, and the scripted pickers, and `tests/bridge.php`, which covers the `--bridge` event mapping, the `ask_user` approval/answer hooks, result capping, protocol-version rejection, progress throttling and image events, and `tests/media.php`, which covers MIME sniffing, downscaling, the content-addressed store, checkpoint dehydration, model gating and the `read_image` tool. It does not make a paid API request.
+Run `composer test` (equivalently, `php tests/smoke.php && php tests/bridge.php`). The smoke test checks local skills and files, starts the bundled stdio MCP example, and exercises tool use, session recovery, compaction handling, the `ask_user` prompt with scripted input, and the security reviewer with fake Anthropic responses. It also runs `tests/ui.php`, which covers ANSI sanitizing, width/wrapping (including that the console-width probe cannot consume a redirected stdin), Markdown rendering, tool summaries, plain-mode compatibility, and the styled/plain agent output paths, `tests/selector.php`, which covers model/effort catalog normalization, clamping, request-body construction, reviewer effort isolation, and the scripted pickers, and `tests/bridge.php`, which covers the `--bridge` event mapping, the `ask_user` approval/answer hooks, result capping, protocol-version rejection, progress throttling, image events and the redirected-channel cases (a file-backed command channel, an empty read that is not end-of-channel, and the dangling-channel diagnostic), and `tests/media.php`, which covers MIME sniffing, downscaling, the content-addressed store, checkpoint dehydration, model gating and the `read_image` tool. It does not make a paid API request.
 
 `php tests/render-demo.php --force --color=always --width=100` prints the visual gallery
 (banner, Markdown, tables, code, tool cards, security prompts, `ask_user`) for manual review.
