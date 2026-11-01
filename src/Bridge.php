@@ -24,6 +24,9 @@ final class Bridge
 {
     public const VERSION = 1;
 
+    /** Empty reads a regular file gets before its channel counts as closed. */
+    private const EMPTY_READ_RETRIES = 3;
+
     private string $buffer = '';
     private bool $eof = false;
     private bool $streamsReady = false;
@@ -32,6 +35,12 @@ final class Bridge
     private ?float $lastProgress = null;
     /** @var array<string, mixed>|null A command that arrived while we waited for another one. */
     private ?array $held = null;
+    /** Consecutive empty reads; reset as soon as bytes arrive. */
+    private int $emptyReads = 0;
+    /** True when stdin was a regular file that already had bytes at startup. */
+    private bool $sawRegularFileWithBytes = false;
+    /** Commands decoded from the channel (any caller), for diagnostics. */
+    private int $commandsDelivered = 0;
 
     /**
      * @param resource|null $in
@@ -293,7 +302,49 @@ final class Bridge
         $this->streamsReady = true;
         if (is_resource($this->in)) {
             @stream_set_blocking($this->in, false);
+            $stat = @fstat($this->in);
+            $this->sawRegularFileWithBytes = is_array($stat)
+                && (((int) ($stat['mode'] ?? 0)) & 0170000) === 0100000
+                && (int) ($stat['size'] ?? 0) > 0;
         }
+    }
+
+    /** Commands decoded from the channel so far. */
+    public function commandsDelivered(): int
+    {
+        return $this->commandsDelivered;
+    }
+
+    /**
+     * A diagnostic when the channel closed before its first command although
+     * stdin was a regular file that had bytes, i.e. a redirected command file
+     * was turned into a silent no-op. Null in every legitimate case (a pipe or
+     * terminal that closed after work, or an empty/NUL input).
+     */
+    public function danglingInputWarning(): ?string
+    {
+        if ($this->commandsDelivered > 0 || !$this->sawRegularFileWithBytes) {
+            return null;
+        }
+
+        return 'the command channel closed before any command was read although stdin '
+            . 'was a file with content; if this was `--bridge < commands.jsonl`, the '
+            . 'file could not be read as stdin';
+    }
+
+    /** True when stdin is a regular file that still has unread bytes. */
+    private function streamLooksUnread(): bool
+    {
+        if (!is_resource($this->in)) {
+            return false;
+        }
+        $stat = @fstat($this->in);
+        if (!is_array($stat) || (((int) ($stat['mode'] ?? 0)) & 0170000) !== 0100000) {
+            return false;
+        }
+        $position = @ftell($this->in);
+
+        return $position !== false && (int) ($stat['size'] ?? 0) > $position;
     }
 
     /** One complete buffered line, or one non-blocking read attempt. */
@@ -313,11 +364,21 @@ final class Bridge
         $chunk = @fread($this->in, 65536);
         if ($chunk === false || $chunk === '') {
             if (!is_resource($this->in) || feof($this->in)) {
+                // A seekable file that still reports unread bytes is not really at
+                // EOF: something else may have advanced the shared file position
+                // (see docs/plans/IMPLEMENTATION_PLAN-bridge-file-stdin.md §1.2).
+                if ($this->emptyReads < self::EMPTY_READ_RETRIES && $this->streamLooksUnread()) {
+                    $this->emptyReads++;
+                    usleep(5000);
+
+                    return null;
+                }
                 $this->eof = true;
             }
 
             return null;
         }
+        $this->emptyReads = 0;
         $this->buffer .= $chunk;
         if (strlen($this->buffer) > 4 * 1024 * 1024) {
             $this->buffer = '';
@@ -360,6 +421,7 @@ final class Bridge
             return null;
         }
         unset($decoded['v']);
+        $this->commandsDelivered++;
 
         return $decoded;
     }

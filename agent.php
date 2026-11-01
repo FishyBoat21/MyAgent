@@ -698,6 +698,11 @@ try {
             }
         }
 
+        if (($dangling = $bridge->danglingInputWarning()) !== null) {
+            // A supervisor can see this on the event stream; a human sees it on STDERR.
+            fwrite(STDERR, '[bridge] ' . $dangling . PHP_EOL);
+            $bridge->emit('warning', ['text' => $dangling]);
+        }
         $bridge->emit('bye', ['reason' => $byeReason, 'code' => 0]);
         foreach ($mcp as $client) {
             $client->close();
