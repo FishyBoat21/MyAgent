@@ -22,6 +22,7 @@
         "test:bridge": "@php tests/bridge.php",
         "test:ui": "@php tests/ui.php",
         "test:selector": "@php tests/selector.php",
+        "test:cancel": "@php tests/cancellation.php",
         "demo": "@php tests/render-demo.php --force --color=always --width=100"
     },
     "suggest": {

@@ -10,9 +10,9 @@ use RuntimeException;
  * Machine-facing transport for `agent.php --bridge`.
  *
  * STDOUT becomes a JSONL event stream and STDIN a JSONL command channel. The
- * bridge owns the ONLY reader of STDIN: the command loop, the ask_user hook and
- * the security-approval hook all pull through awaitCommand(). That single-reader
- * invariant is what keeps the protocol unambiguous.
+ * bridge owns the ONLY reader of STDIN: the command loop, the ask_user hook, the
+ * security-approval hook, and the stop poll of a running turn all read the same
+ * buffer. That single-reader invariant is what keeps the protocol unambiguous.
  *
  * Rules enforced here:
  *  - every emitted line is one JSON object with "v":1, terminated by "\n";
@@ -24,6 +24,9 @@ final class Bridge
 {
     public const VERSION = 1;
 
+    /** Commands that abort the turn in progress instead of queueing for later. */
+    public const STOP_COMMANDS = ['cancel', 'stop', 'interrupt'];
+
     /** Empty reads a regular file gets before its channel counts as closed. */
     private const EMPTY_READ_RETRIES = 3;
 
@@ -33,8 +36,12 @@ final class Bridge
     private int $questionSeq = 0;
     private int $approvalSeq = 0;
     private ?float $lastProgress = null;
-    /** @var array<string, mixed>|null A command that arrived while we waited for another one. */
-    private ?array $held = null;
+    /**
+     * Commands that arrived while another wait was active, in arrival order.
+     *
+     * @var list<array<string, mixed>>
+     */
+    private array $pending = [];
     /** Consecutive empty reads; reset as soon as bytes arrive. */
     private int $emptyReads = 0;
     /** True when stdin was a regular file that already had bytes at startup. */
@@ -113,7 +120,7 @@ final class Bridge
                 return (string) ($command['answer'] ?? '');
             }
             if ($type === 'shutdown') {
-                $this->held = $command;
+                array_unshift($this->pending, $command);
 
                 return null;
             }
@@ -125,11 +132,9 @@ final class Bridge
     /** Block until one command object arrives. Null on EOF. */
     public function nextCommand(): ?array
     {
-        if ($this->held !== null) {
-            $command = $this->held;
-            $this->held = null;
-
-            return $command;
+        $queued = array_shift($this->pending);
+        if ($queued !== null) {
+            return $queued;
         }
 
         return $this->awaitCommand(null, null);
@@ -144,11 +149,9 @@ final class Bridge
      */
     public function awaitCommand(?float $deadline, ?array $types): ?array
     {
-        if ($this->held !== null && ($types === null || in_array((string) ($this->held['type'] ?? ''), $types, true))) {
-            $command = $this->held;
-            $this->held = null;
-
-            return $command;
+        $queued = $this->takeQueued($types);
+        if ($queued !== null) {
+            return $queued;
         }
 
         while (true) {
@@ -181,6 +184,56 @@ final class Bridge
         }
     }
 
+    /**
+     * Take the oldest queued command of an accepted type, leaving the others in
+     * arrival order. `shutdown` is always accepted, whichever wait is active.
+     *
+     * @param null|list<string> $types
+     * @return array<string, mixed>|null
+     */
+    private function takeQueued(?array $types): ?array
+    {
+        foreach ($this->pending as $index => $command) {
+            $type = (string) ($command['type'] ?? '');
+            if ($types === null || in_array($type, $types, true) || $type === 'shutdown') {
+                array_splice($this->pending, $index, 1);
+
+                return $command;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Non-blocking look for a stop request (see STOP_COMMANDS).
+     *
+     * A turn can run for minutes, so the command loop cannot be the only reader:
+     * the agent's wait loops poll here through Cancellation::setPoller(). Every
+     * other command is queued in arrival order and stays visible to
+     * nextCommand(), so the protocol never loses a command.
+     *
+     * @param list<string> $types
+     * @return bool True when a stop command was consumed.
+     */
+    public function pollStop(array $types = self::STOP_COMMANDS): bool
+    {
+        while (true) {
+            $line = $this->pollLine();
+            if ($line === null) {
+                return false;
+            }
+            $command = $this->decodeLine($line);
+            if ($command === null) {
+                continue;
+            }
+            if (in_array((string) $command['type'], $types, true)) {
+                return true;
+            }
+            $this->pending[] = $command;
+        }
+    }
+
     /** @return Closure(string,list<string>): ?string */
     public function askHook(): Closure
     {
@@ -201,7 +254,7 @@ final class Bridge
                 }
                 $type = (string) ($command['type'] ?? '');
                 if ($type === 'shutdown') {
-                    $this->held = $command;
+                    array_unshift($this->pending, $command);
                     $this->emit('question_closed', ['id' => $id, 'reason' => 'cancelled']);
                     throw new RuntimeException('The user cancelled the question without answering. Do not ask it again.');
                 }
@@ -251,7 +304,7 @@ final class Bridge
                 }
                 $type = (string) ($command['type'] ?? '');
                 if ($type === 'shutdown') {
-                    $this->held = $command;
+                    array_unshift($this->pending, $command);
                     break;
                 }
                 if ((string) ($command['id'] ?? '') !== $id) {

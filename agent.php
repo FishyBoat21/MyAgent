@@ -13,6 +13,7 @@ use MyAgent\Agent;
 use MyAgent\AnthropicClient;
 use MyAgent\AskUser;
 use MyAgent\Bridge;
+use MyAgent\Cancellation;
 use MyAgent\LocalTools;
 use MyAgent\McpClient;
 use MyAgent\MediaError;
@@ -74,7 +75,7 @@ if (isset($options['help'])) {
     $help->out("  /session                Show the session name and how to resume it\n");
     $help->out("  /continue               Give unfinished work another step budget\n");
     $help->out("  /help                   Show this command list\n");
-    $help->out("  Ctrl+C                  Exit the session\n");
+    $help->out("  Ctrl+C                  Stop the running turn (again, or when idle, to exit)\n");
     $help->out("\nSet \"api_key\" in the config file, or set the api_key_env environment variable\n");
     $help->out("(default ANTHROPIC_API_KEY). A dedicated security reviewer checks every tool call.\n");
     $help->out("In an interactive terminal the agent can ask single-choice questions via ask_user.\n");
@@ -347,7 +348,25 @@ try {
         $askUser = $isTty ? new AskUser($readLine, null, $ui) : new AskUser();
         $selector = $isTty ? new ModelSelector($readLine, null, $ui) : new ModelSelector();
     }
+    // One stop request per process. Ctrl+C (and, in bridge mode, a `cancel`
+    // command) ends the current turn instead of the whole process.
+    $cancel = new Cancellation();
+    if ($isTty) {
+        // Ctrl+C stops a running turn and exits when idle: the handler is armed
+        // per turn, so the OS default stays in charge at the prompt.
+        $cancel->setInterruptible(true);
+    }
+    if ($bridge !== null) {
+        // The command channel is read from the wait loops as well, so `cancel`
+        // reaches a turn that is already running.
+        $cancel->setPoller(static function () use ($bridge, $cancel): void {
+            if ($bridge->pollStop()) {
+                $cancel->request('bridge');
+            }
+        });
+    }
     $local = new LocalTools($root, $skills, $commandTimeout, $askUser, $mediaNormalizer);
+    $local->setCancellation($cancel);
     // Sessions are always on: every run checkpoints under .agent/sessions, so the
     // work is resumable even when the caller never picked a name. An unnamed run
     // gets a random id, and --continue without a name continues the most recent
@@ -574,6 +593,7 @@ try {
         $mediaStore
     );
     $agent->setToolResultLimit($toolResultLimit);
+    $agent->setCancellation($cancel);
     // Frozen for the process: the tool array is part of the cached prefix and the
     // provider restricts mid-conversation tool mutations.
     $agent->enableMediaTools($imagesEnabled);
@@ -676,14 +696,14 @@ try {
                 $complete = $bridgeImages === []
                     ? $agent->run($text)
                     : $agent->run($promptBlocks($text, $bridgeImages));
-                $bridge->emit('turn_end', ['complete' => $complete]);
-                if (!$complete) {
+                $bridge->emit('turn_end', ['complete' => $complete, 'reason' => $agent->lastOutcome()]);
+                if (!$complete && $agent->lastOutcome() === 'step-limit') {
                     $bridge->emit('warning', ['text' => 'Step limit reached with work in progress. Send continue for another budget.']);
                 }
             } elseif ($commandType === 'continue') {
                 $bridge->emit('turn_start', ['prompt' => null]);
                 $complete = $agent->resume();
-                $bridge->emit('turn_end', ['complete' => $complete]);
+                $bridge->emit('turn_end', ['complete' => $complete, 'reason' => $agent->lastOutcome()]);
             } elseif ($commandType === 'set_model') {
                 try {
                     $agent->setModel((string) ($command['model'] ?? ''));
@@ -717,8 +737,10 @@ try {
             } elseif ($commandType === 'shutdown') {
                 $byeReason = 'shutdown';
                 break;
-            } elseif (in_array($commandType, ['answer', 'cancel', 'verdict'], true)) {
-                $bridge->emit('warning', ['text' => 'stale ' . $commandType . ' ignored: no interaction is pending']);
+            } elseif (in_array($commandType, ['answer', 'cancel', 'stop', 'interrupt', 'verdict'], true)) {
+                // Nothing was waiting for it: a stop only applies to a running turn,
+                // which polls the channel itself (see Bridge::pollStop()).
+                $bridge->emit('warning', ['text' => 'stale ' . $commandType . ' ignored: nothing is running']);
             } else {
                 $bridge->emit('warning', ['text' => 'unknown command: ' . $commandType]);
             }
@@ -876,7 +898,7 @@ try {
             $complete = $agent->run($promptBlocks($prompt, $refs));
         }
     }
-    if (!$complete) {
+    if (!$complete && $agent->lastOutcome() === 'step-limit') {
         $ui->warning('Work is unfinished (step limit). Type /continue for another step budget.');
     }
 
@@ -1005,7 +1027,7 @@ try {
                 '/session            Show the session name and how to resume it',
                 '/continue           Give unfinished work another step budget',
                 '/help               Show this command list',
-                'Ctrl+C              Exit the session',
+                'Ctrl+C              Stop the running turn; press it again to exit',
             ] as $commandLine) {
                 $ui->info($commandLine);
             }
@@ -1199,7 +1221,7 @@ try {
                 $pendingImages = [];
             }
         }
-        if (!$complete) {
+        if (!$complete && $agent->lastOutcome() === 'step-limit') {
             $ui->warning('Work is unfinished (step limit). /continue gives it another step budget.');
         }
     }

@@ -288,7 +288,8 @@ final class Terminal
         }
 
         $width = min($this->width(), 100);
-        $hint = 'Type a task. /model and /effort change the run. /continue resumes. Ctrl+C exits.';
+        $hint = 'Type a task. /model and /effort change the run. /continue resumes. '
+            . 'Ctrl+C stops the running turn, and exits when idle.';
 
         if ($width < 60) {
             $lines = ['MyAgent'];

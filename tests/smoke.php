@@ -91,6 +91,7 @@ function errorOf(callable $run): string
 }
 
 require __DIR__ . '/selector.php';
+require __DIR__ . '/cancellation.php';
 require __DIR__ . '/media.php';
 
 $rendered = '';

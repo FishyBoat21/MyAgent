@@ -403,6 +403,24 @@ try {
     );
 
 
+    // --- B22: a stop command is taken out of band, the rest stays queued ------
+    [$bridge, $out] = bridgeFor([
+        ['type' => 'prompt', 'text' => 'later'],
+        ['type' => 'cancel'],
+        ['type' => 'set_model', 'model' => 'later-model'],
+    ]);
+    check($bridge->pollStop() === true, 'B22 the cancel command was not found during a turn');
+    $queuedPrompt = $bridge->nextCommand();
+    check(($queuedPrompt['type'] ?? '') === 'prompt', 'B22 the poll disturbed the queued command');
+    check($bridge->pollStop() === false, 'B22 a second poll invented a stop');
+    $queuedModel = $bridge->nextCommand();
+    check(($queuedModel['type'] ?? '') === 'set_model', 'B22 the poll reordered the queued commands');
+    check($bridge->nextCommand() === null, 'B22 the channel did not report its end');
+    foreach (Bridge::STOP_COMMANDS as $stopCommand) {
+        [$stopBridge] = bridgeFor([['type' => $stopCommand]]);
+        check($stopBridge->pollStop() === true, 'B22 ' . $stopCommand . ' is not accepted as a stop');
+    }
+
     // --- B18: a file-backed command channel still delivers --------------------
     $commandFile = tempnam(sys_get_temp_dir(), 'myagent-b18-');
     check(is_string($commandFile), 'B18 could not create the temp command file');

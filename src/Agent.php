@@ -44,6 +44,8 @@ class AnthropicClient
      * @var null|list<string>
      */
     private ?array $inputModalities = null;
+    /** Pending stop request for the turn; null disables cancel handling. */
+    private ?Cancellation $cancel = null;
 
     public function __construct(
         private string $apiKey,
@@ -77,11 +79,29 @@ class AnthropicClient
         }
     }
 
+    /**
+     * Wire the stop request. While a request is in flight the flag is checked
+     * from the curl progress callback, which is the only code that still runs.
+     */
+    public function setCancellation(?Cancellation $cancel): void
+    {
+        $this->cancel = $cancel;
+    }
+
+    /** @throws ExecutionStopped when the user stopped the run. */
+    private function throwIfStopped(): void
+    {
+        $this->cancel?->throwIfRequested();
+    }
+
     private function waitWithTicks(float $seconds): void
     {
         $deadline = microtime(true) + $seconds;
         while (($remaining = $deadline - microtime(true)) > 0) {
             $this->tick();
+            // A retry wait is a wait like any other: a stop must not be delayed
+            // until the backoff expires.
+            $this->throwIfStopped();
             usleep((int) (min($remaining, 0.1) * 1_000_000));
         }
     }
@@ -403,6 +423,7 @@ class AnthropicClient
             $headers[] = 'anthropic-beta: ' . implode(',', $betas);
         }
         $payload = $this->encodeRequestBody($body);
+        $this->throwIfStopped(); // nothing is sent once the user has stopped
 
         $retryAfter = null;
         $lastError = '';
@@ -428,9 +449,16 @@ class AnthropicClient
                     return strlen($header);
                 },
             ];
-            if ($this->progress !== null) {
+            if ($this->progress !== null || $this->cancel !== null) {
                 $curlOptions[CURLOPT_NOPROGRESS] = false;
                 $curlOptions[CURLOPT_XFERINFOFUNCTION] = function ($ch, $downloadTotal, $downloaded, $uploadTotal, $uploaded): int {
+                    // A blocked transfer is the one wait nothing else can reach.
+                    // Returning non-zero aborts it with CURLE_ABORTED_BY_CALLBACK,
+                    // which costs one request instead of the whole answer.
+                    $this->cancel?->poll();
+                    if ($this->cancel?->requested() === true) {
+                        return 1;
+                    }
                     $this->tick();
                     return 0;
                 };
@@ -438,10 +466,15 @@ class AnthropicClient
             curl_setopt_array($ch, $curlOptions);
             $responseBody = curl_exec($ch);
             $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            $errno = curl_errno($ch);
             $curlError = curl_error($ch);
             unset($ch); // freed automatically; curl_close() is deprecated in newer PHP
 
             if ($responseBody === false) {
+                if ($errno === CURLE_ABORTED_BY_CALLBACK) {
+                    // A stopped transfer is deliberate: never retry it.
+                    $this->throwIfStopped();
+                }
                 $lastError = 'Network error: ' . $curlError; // Transient: retry.
                 continue;
             }
@@ -587,6 +620,8 @@ final class LocalTools
 {
     /** Images are advertised only while this is true; set once at startup. */
     private bool $mediaEnabled = true;
+    /** Stop request for long-running commands; null when nothing can stop them. */
+    private ?Cancellation $cancel = null;
 
     public function __construct(
         private string $root,
@@ -595,6 +630,12 @@ final class LocalTools
         private ?AskUser $askUser = null,
         private ?MediaNormalizer $media = null,
     ) {
+    }
+
+    /** Wire the process-wide stop request (see Cancellation). */
+    public function setCancellation(?Cancellation $cancel): void
+    {
+        $this->cancel = $cancel;
     }
 
     public function skillsSummary(): string
@@ -871,6 +912,7 @@ final class LocalTools
         if (trim($command) === '') {
             throw new RuntimeException('Empty command');
         }
+        $this->cancel?->throwIfRequested();
         // Capture the child's stdio through files instead of pipes. A child that
         // waits for console input (for example `... | more`) never drains a pipe:
         // the writer blocks, the reader blocks in fread(), and the timeout below
@@ -897,6 +939,24 @@ final class LocalTools
         $status = proc_get_status($process);
         $timedOut = false;
         while ($status['running']) {
+            if ($this->cancel !== null) {
+                $this->cancel->poll();
+                if ($this->cancel->requested()) {
+                    // Kill the tree instead of waiting the command out: the user
+                    // asked for it to end now, and an uncertain result is still
+                    // better than a command that keeps running.
+                    $this->terminateProcessTree($process, (int) ($status['pid'] ?? 0));
+                    $grace = microtime(true) + 2.0;
+                    while ($status['running'] && microtime(true) < $grace) {
+                        usleep(20000);
+                        $status = proc_get_status($process);
+                    }
+                    proc_close($process);
+                    @unlink($stdoutFile);
+                    @unlink($stderrFile);
+                    throw new ExecutionStopped('The command was stopped: ' . $command);
+                }
+            }
             if (microtime(true) >= $deadline) {
                 $timedOut = true;
                 $this->terminateProcessTree($process, (int) ($status['pid'] ?? 0));
@@ -1279,6 +1339,10 @@ final class Agent
     private ?Closure $progressHook = null;
     /** @var array{requests:int,input:int,output:int,cache_read:int,cache_creation:int} */
     private array $usageTotals = ['requests' => 0, 'input' => 0, 'output' => 0, 'cache_read' => 0, 'cache_creation' => 0];
+    /** How the last turn ended: "complete", "step-limit", or "stopped". */
+    private string $outcome = 'complete';
+    /** Stop request for the running turn; null disables stop handling. */
+    private ?Cancellation $cancel = null;
 
     /** @param McpClient[] $mcp */
     public function __construct(
@@ -1434,17 +1498,84 @@ final class Agent
     }
 
     /**
+     * Wire the process-wide stop request: every wait in a turn then honours a
+     * Ctrl+C or a bridge cancel command, including a request in flight.
+     */
+    public function setCancellation(?Cancellation $cancel): void
+    {
+        $this->cancel = $cancel;
+        $this->api->setCancellation($cancel);
+    }
+
+    /** How the last turn ended: "complete", "step-limit", or "stopped". */
+    public function lastOutcome(): string
+    {
+        return $this->outcome;
+    }
+
+    /**
      * @param string|array<int, array<string, mixed>> $prompt A plain text turn, or a
      *        pre-built content-block list ([text, image, ...]).
      */
     public function run(string|array $prompt): bool
     {
-        if (is_string($prompt)) {
-            $this->messages[] = ['role' => 'user', 'content' => $prompt];
-        } else {
-            $this->messages[] = ['role' => 'user', 'content' => self::assertBlocks($prompt)];
+        $this->appendUserMessage($prompt);
+        return $this->turn(fn(): bool => $this->loop($this->maxSteps));
+    }
+
+    /**
+     * Append user content, merging into the previous message when that is also a
+     * user message. A stopped turn can leave its user message unanswered, and the
+     * provider requires the roles to alternate, so merging keeps the next request
+     * valid instead of turning the next prompt into an API error.
+     *
+     * @param string|array<int, array<string, mixed>> $content
+     */
+    private function appendUserMessage(string|array $content): void
+    {
+        // The existing content may hold tool_result blocks, so only the incoming
+        // content is validated as a text/image prompt.
+        $blocks = is_string($content) ? [['type' => 'text', 'text' => $content]] : self::assertBlocks($content);
+        $last = array_key_last($this->messages);
+        if ($last === null || ($this->messages[$last]['role'] ?? '') !== 'user') {
+            $this->messages[] = [
+                'role' => 'user',
+                'content' => is_string($content) ? $content : $blocks,
+            ];
+            return;
         }
-        return $this->loop($this->maxSteps);
+        $this->messages[$last]['content'] = array_merge(
+            self::contentBlocks($this->messages[$last]['content'] ?? ''),
+            $blocks
+        );
+    }
+
+    /**
+     * @param mixed $content A string or a content-block list.
+     * @return array<int, array<string, mixed>>
+     */
+    private static function contentBlocks(mixed $content): array
+    {
+        if (is_string($content)) {
+            return [['type' => 'text', 'text' => $content]];
+        }
+        return is_array($content) ? array_values($content) : [];
+    }
+
+    /**
+     * Run one turn with the stop flag armed, so a Ctrl+C or a cancel command
+     * applies to exactly this turn and never leaks into the next one.
+     *
+     * @param callable(): bool $work
+     */
+    private function turn(callable $work): bool
+    {
+        $this->cancel?->beginTurn();
+        try {
+            return $work();
+        } finally {
+            $this->cancel?->endTurn();
+        }
     }
 
     /**
@@ -1531,14 +1662,18 @@ final class Agent
             $this->messages[] = ['role' => 'user', 'content' => $results];
             $this->checkpoint(true, []);
         }
-        return $this->loop($this->maxSteps);
+        return $this->turn(fn(): bool => $this->loop($this->maxSteps));
     }
 
     private function loop(int $steps): bool
     {
         $system = $this->systemPrompt();
         $tools = $this->toolDefinitions();
+        $this->outcome = 'complete';
         while ($steps > 0) {
+            if ($this->stopped()) {
+                return $this->finishStopped();
+            }
             $steps--;
             $started = microtime(true);
             $spinner = $this->terminal->spinner('Thinking');
@@ -1546,6 +1681,10 @@ final class Agent
             $this->api->setProgressCallback($this->progressHook ?? ($spinner === null ? null : static fn() => $spinner->tick()));
             try {
                 $response = $this->api->message($this->model, $this->maxTokens, $system, $this->messages, $tools);
+            } catch (ExecutionStopped) {
+                // Stopped before the model answered: nothing was recorded, so the
+                // checkpoint keeps the user message and /continue retries it.
+                return $this->finishStopped();
             } finally {
                 $this->api->setProgressCallback(null);
                 $spinner?->stop();
@@ -1608,7 +1747,12 @@ final class Agent
             $this->checkpoint(true, $calls);
             $results = [];
             $total = count($calls);
+            $stoppedAt = null;
             foreach ($calls as $index => $call) {
+                if ($this->stopped()) {
+                    $stoppedAt = $index;
+                    break;
+                }
                 $name = (string) ($call['name'] ?? '');
                 $input = (array) ($call['input'] ?? []);
                 $this->terminal->toolStart($name, $input);
@@ -1630,13 +1774,65 @@ final class Agent
                     array_pop($this->messages); // next iteration re-adds it with one more result
                 }
             }
+            if ($stoppedAt !== null) {
+                // Every tool_use needs a tool_result or the next request is
+                // invalid: close the block and say the rest never ran.
+                for ($index = $stoppedAt; $index < $total; $index++) {
+                    $results[] = self::stoppedToolResult($calls[$index]);
+                }
+                $this->messages[] = ['role' => 'user', 'content' => $results];
+                return $this->finishStopped();
+            }
             $this->checkpoint(true, []);
         }
+        $this->outcome = 'step-limit';
         $resumeHint = $this->store !== null
             ? ' --session=' . $this->store->name() . ' --continue'
             : ' --session=NAME --continue';
         $this->terminal->warning("Step limit ({$this->maxSteps}) reached with work in progress. Resume with{$resumeHint}.");
         return false;
+    }
+
+    /** True when a stop is pending; also lets an out-of-band source fire. */
+    private function stopped(): bool
+    {
+        if ($this->cancel === null) {
+            return false;
+        }
+        $this->cancel->poll();
+        return $this->cancel->requested();
+    }
+
+    /**
+     * End the turn on a stop. Everything that already happened is kept and the
+     * unfinished work stays resumable, so a stop costs nothing but time.
+     */
+    private function finishStopped(): bool
+    {
+        $this->outcome = 'stopped';
+        $this->checkpoint(true, []);
+        $reason = $this->cancel?->message() ?? 'Stopped.';
+        $resume = $this->store !== null
+            ? ' /continue (or php agent.php --session=' . $this->store->name() . ' --continue) retries the turn.'
+            : ' The remaining work was not run.';
+        $this->terminal->warning($reason . ' The session is kept;' . $resume);
+        return false;
+    }
+
+    /**
+     * A tool_result for a call that a stop prevented from running.
+     *
+     * @param array<string, mixed> $call
+     * @return array<string, mixed>
+     */
+    private static function stoppedToolResult(array $call): array
+    {
+        return [
+            'type' => 'tool_result',
+            'tool_use_id' => (string) ($call['id'] ?? ''),
+            'content' => 'The user stopped the execution before this call ran. It was NOT executed, so check the current state before calling it again.',
+            'is_error' => true,
+        ];
     }
 
     /** @return array<string, mixed> A tool_result block for one tool_use block. */
@@ -1646,6 +1842,10 @@ final class Agent
         $id = (string) ($call['id'] ?? '');
         $input = (array) ($call['input'] ?? []);
         $block = ['type' => 'tool_result', 'tool_use_id' => $id];
+        if ($this->stopped()) {
+            // Never spend a reviewer call, or run anything, once the user stopped.
+            return self::stoppedToolResult($call);
+        }
         if ($this->security !== null) {
             // Dedicated-model gate: nothing runs until the reviewer allows it.
             try {
@@ -1676,6 +1876,9 @@ final class Agent
                 ? $this->limitRichToolResult($name, $output)
                 : $this->limitToolResult($name, $output);
             return $block;
+        } catch (ExecutionStopped $e) {
+            // A long tool was killed mid-flight: report it, never repeat it here.
+            $block['content'] = $e->getMessage() . ' Its effects are uncertain, so check them before repeating it.';
         } catch (RuntimeException $e) {
             $block['content'] = 'Error: ' . $e->getMessage();
         } catch (Throwable $e) {

@@ -14,7 +14,7 @@ Composer manages autoloading and the test scripts. There are no third-party runt
 
 2. Copy `config.example.json` to `config.json` **next to `agent.php`** and edit it. Remove the example MCP server if you do not need it. The agent always reads this file from its own folder, so it can be launched from any working directory; the working directory only determines what the agent operates on.
 2. Set `"api_key"` in `config.json`, or leave it empty and set `ANTHROPIC_API_KEY` in your environment. A non-empty `api_key` wins; `api_key_env` names the fallback variable (default `ANTHROPIC_API_KEY`; set it to `""` to require the config key only).
-3. Run `php agent.php "Inspect this project and summarize it"` to open a session with that first task, or `php agent.php` for an empty interactive session. `composer` itself is only needed to install/refresh the autoloader; the agent runs directly with `php`. A finished answer never closes the session: type the next instruction at the `you>` prompt. In a terminal, only `Ctrl+C` ends the process; `/exit` and `/quit` do not exist.
+3. Run `php agent.php "Inspect this project and summarize it"` to open a session with that first task, or `php agent.php` for an empty interactive session. `composer` itself is only needed to install/refresh the autoloader; the agent runs directly with `php`. A finished answer never closes the session: type the next instruction at the `you>` prompt. In a terminal `Ctrl+C` stops the run in progress and, pressed again or at the `you>` prompt, ends the process (see [Stopping a run](#stopping-a-run)); `/exit` and `/quit` do not exist.
 
 Use `--config=path`, `--model=MODEL`, `--effort=LEVEL`, `--max-steps=N`, or `--command-timeout=N` to override settings. Without `--config`, the agent reads `config.json` from the folder containing `agent.php` — not from the working directory. An explicit `--config` path is used as given, so a relative path resolves against the working directory. The model defaults to `config.model`; see [Models and effort](#models-and-effort). Each model request waits for a complete response before tools run.
 
@@ -138,7 +138,8 @@ In an interactive terminal MyAgent renders a styled session:
 │ security   reviewer deepseek-flash · fail-closed         │
 │ tools      5 local · 1 MCP server                        │
 ╰──────────────────────────────────────────────────────────╯
-  Type a task. /model and /effort change the run. /continue resumes. Ctrl+C exits.
+  Type a task. /model and /effort change the run. /continue resumes. Ctrl+C stops
+  the running turn, and exits when idle.
 
 ❯ Summarize the architecture.
 ⏺ The project has three layers. …
@@ -226,7 +227,8 @@ model calls by default, per invocation). Repeating `--continue` gives it another
 budget. A new prompt with the same session name adds instructions to that conversation.
 When stdin is not a terminal (piped input), exit code `2` means the step limit was reached
 with work unfinished and exit code `1` means an error; an interactive terminal keeps the
-session open instead, and only `Ctrl+C` ends it. Session checkpoints include messages and
+session open instead, and only `Ctrl+C` ends it - as a stop, not a crash (see
+[Stopping a run](#stopping-a-run)). Session checkpoints include messages and
 tool outputs, so keep `.agent/` private and add it to the project's `.gitignore` (this repository already ignores it). The API key is never saved
 there. Checkpoints are never pruned automatically — delete `.agent/sessions/*.json` (and
 the matching `.lock`) when a session is no longer needed. If `.agent/sessions/` cannot be
@@ -242,6 +244,55 @@ A model `stop` (`end_turn`) only ends the current turn, never the session: a sin
 Checkpoints are written before each tool call and after each result. If the process stops during a tool call, the agent reports that call as **uncertain** on resume and asks the model to inspect its effects. It does not automatically repeat the call.
 
 The Anthropic client retries temporary network, rate limit, and server errors twice with backoff. Stable tool definitions use a prompt cache breakpoint. Server-side compaction is enabled at `compaction_threshold` input tokens (100,000 by default) to keep old context concise; set it to `0` to disable it. Compaction is a beta feature and requires a supported Claude model. It can omit details from earlier turns, so keep durable task decisions in project files.
+
+## Stopping a run
+
+A run can be stopped while it is working, and the stop always ends the **turn**, never
+the session:
+
+| How the agent was started | How to stop |
+|---|---|
+| Interactive terminal | `Ctrl+C` |
+| `--bridge` | a `cancel` command (`stop` and `interrupt` are aliases) |
+| Piped stdin, no terminal | no stop channel; `Ctrl+C` ends the process as it always did |
+
+`Ctrl+C` is delivered by the console control handler (Windows) or a SIGINT handler
+(POSIX). The handler exists **only while a turn is running**: PHP cannot interrupt a
+blocking transfer without one, but leaving it installed would take Ctrl+C away from the
+process when idle (a handler that declines the event is ignored, and exiting from the
+console thread deadlocks when the main thread is blocked in a read). So at the `you>`
+prompt the platform default still applies and `Ctrl+C` exits with code 130, exactly as
+before; while a turn runs, the flag it sets is read everywhere the agent waits, so a stop
+does not have to wait for the work to finish:
+
+- a model request in flight is aborted from the curl progress callback, so one request is
+  cancelled instead of being paid for and then ignored;
+- `run_command` kills the process tree instead of running out its timeout;
+- nothing new starts: no further model call, no further tool call, and no
+  security-reviewer call.
+
+What a stop leaves behind:
+
+- the assistant text and the tool results already produced;
+- a checkpoint marked unfinished, so `/continue` (or `--session=NAME --continue`) retries
+  the turn — a stopped model request is simply asked again;
+- one `tool_result` for every `tool_use` in the interrupted round, because the provider
+  rejects an unanswered call. A call that never ran gets an error result that says so, and
+  the existing "uncertain effects" rule still keeps an interrupted tool from being re-run
+  automatically.
+
+A second `Ctrl+C` while a stop is pending asks for a hard exit, which the main thread
+carries out at its next poll point - no thread unwinds the PHP VM from the outside - so a
+wedged tool cannot trap the terminal. A stop belongs to the turn that is running: the next
+prompt starts with a clean flag, and the handler is disarmed again so `Ctrl+C` exits.
+
+In `--bridge` mode the same event is visible on the stream instead: `turn_end` carries
+`reason` (`complete`, `step-limit`, or `stopped`), and a `cancel` that arrives while
+nothing is running is reported as a `warning`, because there is nothing to stop.
+
+A pending `ask_user` question or security approval cannot be interrupted from the
+keyboard, because that read blocks; the stop takes effect as soon as the prompt is
+answered.
 
 ## Local tools
 
@@ -455,7 +506,7 @@ reject another version: the bridge answers
 | Type | Payload |
 |---|---|
 | `ready` | `session, session_new, workspace, model, effort, identity, security{model,fail_closed,enabled}, tools, mcp[], pid, ask_user, media{enabled,images,max_bytes,max_edge,store}` |
-| `turn_start` / `turn_end` | `prompt` (null for a resume) / `complete` (false = step limit) |
+| `turn_start` / `turn_end` | `prompt` (null for a resume) / `complete` (false = unfinished), `reason` (`complete`, `step-limit`, `stopped`) |
 | `assistant` | `text` — raw Markdown |
 | `tool_start` / `tool_result` | `id, name, input` / `+ result, result_truncated, result_bytes, is_error, duration, media[]` |
 | `usage` | `input, output, cache_read, cache_creation, duration, stop_reason` |
@@ -472,6 +523,11 @@ reject another version: the bridge answers
 
 **STDIN (supervisor → child)**: `prompt`, `continue`, `answer`, `cancel`, `verdict`,
 `set_model`, `set_effort`, `cache_report`, `shutdown`.
+
+`cancel` (aliases `stop`, `interrupt`) aborts the turn in progress instead of being
+queued: the agent polls the command channel from its wait loops, so the command reaches a
+request or a command that is already running. `turn_end` then reports
+`{"complete":false,"reason":"stopped"}`. See [Stopping a run](#stopping-a-run).
 
 A `prompt` command may carry images by **path**, resolved by the child inside the workspace:
 
@@ -505,7 +561,7 @@ Without `--bridge`, MyAgent behaves exactly as before.
 
 ## Verify
 
-Run `composer test` (equivalently, `php tests/smoke.php && php tests/bridge.php`). The smoke test checks local skills and files, starts the bundled stdio MCP example, and exercises tool use, session recovery, compaction handling, the `ask_user` prompt with scripted input, and the security reviewer with fake Anthropic responses. It also runs `tests/ui.php`, which covers ANSI sanitizing, width/wrapping (including that the console-width probe cannot consume a redirected stdin), Markdown rendering, tool summaries, plain-mode compatibility, and the styled/plain agent output paths, `tests/selector.php`, which covers model/effort catalog normalization, clamping, request-body construction, reviewer effort isolation, and the scripted pickers, and `tests/bridge.php`, which covers the `--bridge` event mapping, the `ask_user` approval/answer hooks, result capping, protocol-version rejection, progress throttling, image events and the redirected-channel cases (a file-backed command channel, an empty read that is not end-of-channel, and the dangling-channel diagnostic), and `tests/media.php`, which covers MIME sniffing, downscaling, the content-addressed store, checkpoint dehydration, model gating and the `read_image` tool. It does not make a paid API request.
+Run `composer test` (equivalently, `php tests/smoke.php && php tests/bridge.php`). The smoke test checks local skills and files, starts the bundled stdio MCP example, and exercises tool use, session recovery, compaction handling, the `ask_user` prompt with scripted input, and the security reviewer with fake Anthropic responses. It also runs `tests/ui.php`, which covers ANSI sanitizing, width/wrapping (including that the console-width probe cannot consume a redirected stdin), Markdown rendering, tool summaries, plain-mode compatibility, and the styled/plain agent output paths, `tests/selector.php`, which covers model/effort catalog normalization, clamping, request-body construction, reviewer effort isolation, and the scripted pickers, and `tests/bridge.php`, which covers the `--bridge` event mapping, the `ask_user` approval/answer hooks, result capping, protocol-version rejection, progress throttling, image events and the redirected-channel cases (a file-backed command channel, an empty read that is not end-of-channel, and the dangling-channel diagnostic), `tests/media.php`, which covers MIME sniffing, downscaling, the content-addressed store, checkpoint dehydration, model gating and the `read_image` tool, and `tests/cancellation.php`, which covers the stop flag and its poller, a refused request, a transfer aborted through the curl progress callback, a killed `run_command`, the recovery of a stopped turn (including the alternating-role repair), and the real `Ctrl+C` handler driven by a console event in a child process. It does not make a paid API request.
 
 `php tests/render-demo.php --force --color=always --width=100` prints the visual gallery
 (banner, Markdown, tables, code, tool cards, security prompts, `ask_user`) for manual review.
